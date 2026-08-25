@@ -65,45 +65,41 @@ function adminCookie(token:string,maxAge:number){
 function clearAdminCookie(){
   return adminCookie("",0);
 }
-async function adminSigningKey(c:any){
-  const cfg=adminConfig(c);
-  const secret=cleanSecret(c.env.SESSION_SECRET)||cfg.password||cfg.hash||cfg.email||"ai-screening-admin";
-  return crypto.subtle.importKey("raw",enc.encode(secret),{name:"HMAC",hash:"SHA-256"},false,["sign","verify"]);
+async function ensureAuthSessions(db:D1Database){
+  await db.prepare("CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires_at TEXT NOT NULL)").run();
 }
 async function createAdminSession(c:any,email:string){
-  const payload=b64url(enc.encode(JSON.stringify({sub:"super-admin",email,exp:Math.floor(Date.now()/1000)+7*86400,iat:Math.floor(Date.now()/1000)})));
-  const key=await adminSigningKey(c);
-  const sig=b64url(new Uint8Array(await crypto.subtle.sign("HMAC",key,enc.encode(payload))));
-  const token=`${payload}.${sig}`;
-  c.header("Set-Cookie",adminCookie(token,7*86400));
+  // Super Admin uses the same D1 session mechanism as normal authentication.
+  // This avoids a second HMAC session format that can validate differently
+  // between /api/admin/login and /api/auth/me.
+  await ensureAuthSessions(c.env.DB);
+  const token=b64url(crypto.getRandomValues(new Uint8Array(32)));
+  const expires=new Date(Date.now()+7*86400000).toISOString();
+  await c.env.DB.prepare("INSERT INTO sessions(token,user_id,expires_at) VALUES(?,?,?)")
+    .bind(await sha256(token),"super-admin",expires).run();
+  c.header("Set-Cookie",setCookie(token,7*86400));
   return token;
 }
 async function currentAdminCookie(c:any):Promise<AuthUser|null>{
   const h=c.req.raw.headers.get("Cookie")||"";
-  const cookieToken=h.match(/(?:^|;\s*)ats_admin=([^;]+)/)?.[1] || null;
+  const cookieToken=h.match(/(?:^|;\s*)ats_session=([^;]+)/)?.[1] || null;
   const auth=c.req.raw.headers.get("Authorization")||"";
   const bearer=auth.match(/^Bearer\s+(.+)$/i)?.[1] || null;
-  // Prefer the explicit Bearer token when present. A stale/invalid cookie must
-  // never override a fresh token returned by /api/admin/login.
   const candidates=[bearer,cookieToken].filter(Boolean) as string[];
   if(!candidates.length)return null;
-  for(const token of candidates){
-   try{
-    const [payload,sig]=token.split(".");
-    if(!payload||!sig)continue;
-    const key=await adminSigningKey(c);
-    const sb=sig.replace(/-/g,"+").replace(/_/g,"/");
-    const bin=atob(sb+"=".repeat((4-sb.length%4)%4));
-    const ok=await crypto.subtle.verify("HMAC",key,Uint8Array.from(bin,ch=>ch.charCodeAt(0)),enc.encode(payload));
-    if(!ok)continue;
-    const pb=payload.replace(/-/g,"+").replace(/_/g,"/");
-    const pbin=atob(pb+"=".repeat((4-pb.length%4)%4));
-    const data=JSON.parse(pbin);
-    const cfg=adminConfig(c);
-    if(data.sub!=="super-admin"||!data.email||data.email!==cfg.email||Number(data.exp||0)<Math.floor(Date.now()/1000))continue;
-    return {id:"super-admin",company_id:"platform",name:"Super Admin",email:cfg.email,role:"admin",company_name:"AI Screening Platform"};
+  try{
+    await ensureAuthSessions(c.env.DB);
+    for(const token of candidates){
+      const tokenHash=await sha256(token);
+      const session=await c.env.DB.prepare(
+        "SELECT user_id FROM sessions WHERE token=? AND expires_at>CURRENT_TIMESTAMP LIMIT 1"
+      ).bind(tokenHash).first<any>();
+      if(session?.user_id!=="super-admin")continue;
+      const cfg=adminConfig(c);
+      if(!cfg.email)continue;
+      return {id:"super-admin",company_id:"platform",name:"Super Admin",email:cfg.email,role:"admin",company_name:"AI Screening Platform"};
+    }
   }catch{}
-  }
   return null;
 }
 async function columns(db:D1Database,table:string){const r=await db.prepare(`PRAGMA table_info(${table})`).all<any>();return new Set((r.results||[]).map((x:any)=>String(x.name)))}
@@ -265,7 +261,12 @@ app.post("/api/auth/login",async c=>{
 app.post("/api/auth/logout",async c=>{
   try{
     const raw=cookieToken(c.req.raw);
-    if(raw)await c.env.DB.prepare("DELETE FROM sessions WHERE token=?").bind(await sha256(raw)).run();
+    const auth=c.req.raw.headers.get("Authorization")||"";
+    const bearer=auth.match(/^Bearer\s+(.+)$/i)?.[1] || null;
+    const tokens=[raw,bearer].filter(Boolean) as string[];
+    for(const token of tokens){
+      await c.env.DB.prepare("DELETE FROM sessions WHERE token=?").bind(await sha256(token)).run();
+    }
   }catch{}
   c.header("Set-Cookie",setCookie("",0));
   c.header("Set-Cookie",clearAdminCookie(),{append:true});
