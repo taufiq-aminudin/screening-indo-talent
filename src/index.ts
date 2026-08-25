@@ -395,12 +395,40 @@ app.post("/api/jobs",async c=>{
       : description;
 
     const jid=id();
-    await c.env.DB.prepare(
-      "INSERT INTO jobs(id,company_id,title,location,salary,description,status,created_at) VALUES(?,?,?,?,?,?,?,CURRENT_TIMESTAMP)"
-    ).bind(jid,u.company_id,title,location,salary,finalDescription,"open").run();
+    // Resolve the tenant/company key from the authenticated user before inserting.
+    // Some older company accounts can carry a stale company_id; jobs.company_id has a
+    // foreign-key constraint, so blindly inserting that value causes SQLITE_CONSTRAINT_FOREIGNKEY.
+    const ur=await c.env.DB.prepare("SELECT id,company_id FROM users WHERE id=? LIMIT 1").bind(u.id).first<any>();
+    const candidates=[String(u.company_id||""),String(ur?.company_id||""),String(ur?.id||u.id)].filter(Boolean);
+    const unique=[...new Set(candidates)];
+    let insertedCompanyId="";
+    let lastError:any=null;
+    for(const companyId of unique){
+      try{
+        await c.env.DB.prepare(
+          "INSERT INTO jobs(id,company_id,title,location,salary,description,status,created_at) VALUES(?,?,?,?,?,?,?,CURRENT_TIMESTAMP)"
+        ).bind(jid,companyId,title,location,salary,finalDescription,"open").run();
+        insertedCompanyId=companyId;
+        break;
+      }catch(e:any){
+        lastError=e;
+        const msg=String(e?.message||e);
+        if(!/FOREIGN KEY|SQLITE_CONSTRAINT_FOREIGNKEY/i.test(msg)) throw e;
+      }
+    }
+    if(!insertedCompanyId){
+      return c.json({
+        error:"job_company_context_invalid",
+        detail:"Company account is not linked to a valid company record. Please refresh the company profile or contact the administrator.",
+        user_id:u.id,
+        company_id:u.company_id||null,
+        tried_company_ids:unique,
+        cause:String(lastError?.message||lastError||"unknown")
+      },409);
+    }
 
-    await audit(c,u,"job.create",jid);
-    return c.json({ok:true,id:jid,title},201);
+    await audit(c,{...u,company_id:insertedCompanyId},"job.create",jid);
+    return c.json({ok:true,id:jid,title,company_id:insertedCompanyId},201);
   }catch(e:any){
     return c.json({error:"job_create_failed",detail:String(e?.message||e)},500);
   }
