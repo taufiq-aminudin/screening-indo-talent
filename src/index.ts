@@ -46,7 +46,7 @@ function b64url(bytes:Uint8Array){let binary="";for(const b of bytes)binary+=Str
 function hex(bytes:Uint8Array){return [...bytes].map(b=>b.toString(16).padStart(2,"0")).join("")}
 async function sha256(v:string){return hex(new Uint8Array(await crypto.subtle.digest("SHA-256",enc.encode(v))))}
 async function passwordHash(password:string){const salt=new Uint8Array(16);crypto.getRandomValues(salt);const key=await crypto.subtle.importKey("raw",enc.encode(password),"PBKDF2",false,["deriveBits"]);const bits=await crypto.subtle.deriveBits({name:"PBKDF2",salt,iterations:100000,hash:"SHA-256"},key,256);return `pbkdf2$100000$${b64url(salt)}$${b64url(new Uint8Array(bits))}`}
-async function passwordVerify(password:string,stored:string){try{const [scheme,it,saltText,expected]=stored.split("$");if(scheme!=="pbkdf2")return false;const sb=saltText.replace(/-/g,"+").replace(/_/g,"/");const bin=atob(sb+"=".repeat((4-sb.length%4)%4));const salt=Uint8Array.from(bin,c=>c.charCodeAt(0));const key=await crypto.subtle.importKey("raw",enc.encode(password),"PBKDF2",false,["deriveBits"]);const iterations=Math.max(100000,Math.min(Number(it)||100000,600000));const bits=await crypto.subtle.deriveBits({name:"PBKDF2",salt,iterations,hash:"SHA-256"},key,256);return b64url(new Uint8Array(bits))===expected}catch{return false}}
+async function passwordVerify(password:string,stored:string){try{const [scheme,it,saltText,expected]=stored.split("$");if(scheme!=="pbkdf2")return false;const sb=saltText.replace(/-/g,"+").replace(/_/g,"/");const bin=atob(sb+"=".repeat((4-sb.length%4)%4));const salt=Uint8Array.from(bin,c=>c.charCodeAt(0));const key=await crypto.subtle.importKey("raw",enc.encode(password),"PBKDF2",false,["deriveBits"]);const iterations=Math.min(Number(it)||100000,100000);const bits=await crypto.subtle.deriveBits({name:"PBKDF2",salt,iterations,hash:"SHA-256"},key,256);return b64url(new Uint8Array(bits))===expected}catch{return false}}
 function cookieToken(req:Request){
   const h=req.headers.get("Cookie")||"";
   return h.match(/(?:^|;\s*)ats_session=([^;]+)/)?.[1]
@@ -65,38 +65,40 @@ function adminCookie(token:string,maxAge:number){
 function clearAdminCookie(){
   return adminCookie("",0);
 }
-async function ensureAuthSessions(db:D1Database){
-  await db.prepare("CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, user_id TEXT NOT NULL, expires_at TEXT NOT NULL)").run();
+async function adminSigningKey(c:any){
+  const cfg=adminConfig(c);
+  const secret=cleanSecret(c.env.SESSION_SECRET)||cfg.password||cfg.hash||cfg.email||"ai-screening-admin";
+  return crypto.subtle.importKey("raw",enc.encode(secret),{name:"HMAC",hash:"SHA-256"},false,["sign","verify"]);
 }
 async function createAdminSession(c:any,email:string){
-  // Super Admin uses the same D1 session mechanism as normal authentication.
-  // This avoids a second HMAC session format that can validate differently
-  // between /api/admin/login and /api/auth/me.
-  await ensureAuthSessions(c.env.DB);
-  const token=b64url(crypto.getRandomValues(new Uint8Array(32)));
-  const expires=new Date(Date.now()+7*86400000).toISOString();
-  await c.env.DB.prepare("INSERT INTO sessions(token,user_id,expires_at) VALUES(?,?,?)")
-    .bind(await sha256(token),"super-admin",expires).run();
-  c.header("Set-Cookie",setCookie(token,7*86400));
+  const payload=b64url(enc.encode(JSON.stringify({sub:"super-admin",email,exp:Math.floor(Date.now()/1000)+7*86400,iat:Math.floor(Date.now()/1000)})));
+  const key=await adminSigningKey(c);
+  const sig=b64url(new Uint8Array(await crypto.subtle.sign("HMAC",key,enc.encode(payload))));
+  const token=`${payload}.${sig}`;
+  c.header("Set-Cookie",adminCookie(token,7*86400));
   return token;
 }
 async function currentAdminCookie(c:any):Promise<AuthUser|null>{
   const h=c.req.raw.headers.get("Cookie")||"";
-  const cookieToken=h.match(/(?:^|;\s*)ats_session=([^;]+)/)?.[1] || null;
+  const cookieToken=h.match(/(?:^|;\s*)ats_admin=([^;]+)/)?.[1] || null;
   const auth=c.req.raw.headers.get("Authorization")||"";
   const bearer=auth.match(/^Bearer\s+(.+)$/i)?.[1] || null;
-  const candidates=[bearer,cookieToken].filter(Boolean) as string[];
+  const candidates=[cookieToken,bearer].filter(Boolean) as string[];
   if(!candidates.length)return null;
   try{
-    await ensureAuthSessions(c.env.DB);
+    const key=await adminSigningKey(c);
+    const cfg=adminConfig(c);
     for(const token of candidates){
-      const tokenHash=await sha256(token);
-      const session=await c.env.DB.prepare(
-        "SELECT user_id FROM sessions WHERE token=? AND expires_at>CURRENT_TIMESTAMP LIMIT 1"
-      ).bind(tokenHash).first<any>();
-      if(session?.user_id!=="super-admin")continue;
-      const cfg=adminConfig(c);
-      if(!cfg.email)continue;
+      const [payload,sig]=token.split(".");
+      if(!payload||!sig)continue;
+      const sb=sig.replace(/-/g,"+").replace(/_/g,"/");
+      const bin=atob(sb+"=".repeat((4-sb.length%4)%4));
+      const ok=await crypto.subtle.verify("HMAC",key,Uint8Array.from(bin,ch=>ch.charCodeAt(0)),enc.encode(payload));
+      if(!ok)continue;
+      const pb=payload.replace(/-/g,"+").replace(/_/g,"/");
+      const pbin=atob(pb+"=".repeat((4-pb.length%4)%4));
+      const data=JSON.parse(pbin);
+      if(data.sub!=="super-admin"||!data.email||data.email!==cfg.email||Number(data.exp||0)<Math.floor(Date.now()/1000))continue;
       return {id:"super-admin",company_id:"platform",name:"Super Admin",email:cfg.email,role:"admin",company_name:"AI Screening Platform"};
     }
   }catch{}
@@ -261,12 +263,7 @@ app.post("/api/auth/login",async c=>{
 app.post("/api/auth/logout",async c=>{
   try{
     const raw=cookieToken(c.req.raw);
-    const auth=c.req.raw.headers.get("Authorization")||"";
-    const bearer=auth.match(/^Bearer\s+(.+)$/i)?.[1] || null;
-    const tokens=[raw,bearer].filter(Boolean) as string[];
-    for(const token of tokens){
-      await c.env.DB.prepare("DELETE FROM sessions WHERE token=?").bind(await sha256(token)).run();
-    }
+    if(raw)await c.env.DB.prepare("DELETE FROM sessions WHERE token=?").bind(await sha256(raw)).run();
   }catch{}
   c.header("Set-Cookie",setCookie("",0));
   c.header("Set-Cookie",clearAdminCookie(),{append:true});
@@ -866,7 +863,6 @@ app.post("/api/ai/screen",async c=>{
 });
 
 app.get("/api/admin/config-status",async c=>{
-  c.header("Cache-Control","no-store, no-cache, must-revalidate");
   const cfg=adminConfig(c);
   return c.json({
     ok:Boolean(cfg.email && (cfg.password || cfg.hash)),
@@ -926,17 +922,17 @@ app.post("/api/admin/login",async c=>{
     const u:AuthUser={id:"super-admin",company_id:"platform",name:"Super Admin",email:configuredEmail,role:"admin",company_name:"AI Screening Platform"};
 
     stage.step="create_admin_cookie";
-    let token="";
+    let adminToken="";
     try{
-      token=await createAdminSession(c,configuredEmail);
+      adminToken=await createAdminSession(c,configuredEmail);
     }catch(e:any){
       return c.json({error:"admin_session_failed",detail:String(e?.message||e),stage:stage.step,build:"V6.49"},503);
     }
 
     // Audit is deliberately best-effort and can never block authentication.
     stage.step="audit";
-    try{await audit(c,u,"admin.login",u.id)}catch{}
-    return c.json({user:u,admin_token:token,auth_source:"bootstrap_secret",build:"V6.50"});
+    await audit(c,u,"admin.login",u.id);
+    return c.json({user:u,admin_token:adminToken,auth_source:"bootstrap_secret",build:"V6.49"});
   }catch(e:any){
     return c.json({error:"admin_login_failed",detail:String(e?.message||e),stage:stage.step,build:"V6.49"},500);
   }
