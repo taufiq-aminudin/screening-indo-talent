@@ -80,26 +80,31 @@ async function createAdminSession(c:any,email:string){
 }
 async function currentAdminCookie(c:any):Promise<AuthUser|null>{
   const h=c.req.raw.headers.get("Cookie")||"";
-  const cookieToken=h.match(/(?:^|;\s*)ats_admin=([^;]+)/)?.[1];
+  const cookieToken=h.match(/(?:^|;\s*)ats_admin=([^;]+)/)?.[1] || null;
   const auth=c.req.raw.headers.get("Authorization")||"";
-  const bearer=auth.match(/^Bearer\s+(.+)$/i)?.[1];
-  const token=cookieToken||bearer||null;
-  if(!token)return null;
-  try{
+  const bearer=auth.match(/^Bearer\s+(.+)$/i)?.[1] || null;
+  // Prefer the explicit Bearer token when present. A stale/invalid cookie must
+  // never override a fresh token returned by /api/admin/login.
+  const candidates=[bearer,cookieToken].filter(Boolean) as string[];
+  if(!candidates.length)return null;
+  for(const token of candidates){
+   try{
     const [payload,sig]=token.split(".");
-    if(!payload||!sig)return null;
+    if(!payload||!sig)continue;
     const key=await adminSigningKey(c);
     const sb=sig.replace(/-/g,"+").replace(/_/g,"/");
     const bin=atob(sb+"=".repeat((4-sb.length%4)%4));
     const ok=await crypto.subtle.verify("HMAC",key,Uint8Array.from(bin,ch=>ch.charCodeAt(0)),enc.encode(payload));
-    if(!ok)return null;
+    if(!ok)continue;
     const pb=payload.replace(/-/g,"+").replace(/_/g,"/");
     const pbin=atob(pb+"=".repeat((4-pb.length%4)%4));
     const data=JSON.parse(pbin);
     const cfg=adminConfig(c);
-    if(data.sub!=="super-admin"||!data.email||data.email!==cfg.email||Number(data.exp||0)<Math.floor(Date.now()/1000))return null;
+    if(data.sub!=="super-admin"||!data.email||data.email!==cfg.email||Number(data.exp||0)<Math.floor(Date.now()/1000))continue;
     return {id:"super-admin",company_id:"platform",name:"Super Admin",email:cfg.email,role:"admin",company_name:"AI Screening Platform"};
-  }catch{return null}
+  }catch{}
+  }
+  return null;
 }
 async function columns(db:D1Database,table:string){const r=await db.prepare(`PRAGMA table_info(${table})`).all<any>();return new Set((r.results||[]).map((x:any)=>String(x.name)))}
 async function createSession(c:any,u:AuthUser){
