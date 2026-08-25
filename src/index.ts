@@ -202,6 +202,15 @@ async function resolveJobCompanyId(db:D1Database,u:AuthUser):Promise<{companyId:
   throw new Error(`job_company_fk_unresolved:${parentTable}.${parentColumn}`);
 }
 
+// Resolve the same tenant/company key used by jobs for every company-facing query.
+// This prevents a newly-created job from being invisible when a legacy account's
+// users.company_id differs from the actual FK target of jobs.company_id.
+async function effectiveCompanyId(db:D1Database,u:AuthUser):Promise<string>{
+  if(u.role==='admin') return String(u.company_id||'platform');
+  const ctx=await resolveJobCompanyId(db,u);
+  return String(ctx.companyId);
+}
+
 async function requireAuth(c:any,next:any){
   try{
     const u=await currentUser(c);
@@ -372,15 +381,16 @@ app.get("/api/admin/orders",requireAuth,async c=>{try{const u=c.get("user") as A
 app.post("/api/admin/orders/:id/approve",requireAuth,async c=>{try{const u=c.get("user") as AuthUser;if(u.role!=="admin")return c.json({error:"admin_required"},403);await ensureCommercialSchema(c.env.DB);const oid=c.req.param("id");const body=await c.req.json<any>().catch(()=>({}));const o=await c.env.DB.prepare("SELECT * FROM credit_orders WHERE id=? LIMIT 1").bind(oid).first<any>();if(!o)return c.json({error:"order_not_found"},404);if(o.status==='paid')return c.json({ok:true,already_paid:true});if(!['pending','awaiting_payment','payment_submitted'].includes(String(o.status)))return c.json({error:"order_not_pending",status:o.status},409);if(!o.payment_proof_key)return c.json({error:"payment_proof_required",detail:"Super Admin hanya dapat approve setelah bukti transfer di-upload oleh company."},400);const w=await ensureWallet(c.env.DB,o.company_id);const next=Number(w?.balance||0)+Number(o.credits||0);const reference=String(body.payment_reference||("ADMIN-"+u.id)).trim().slice(0,120);await c.env.DB.batch([c.env.DB.prepare("UPDATE credit_wallets SET balance=?,lifetime_purchased=lifetime_purchased+?,updated_at=CURRENT_TIMESTAMP WHERE company_id=?").bind(next,o.credits,o.company_id),c.env.DB.prepare("UPDATE credit_orders SET status='paid',payment_reference=?,paid_at=CURRENT_TIMESTAMP WHERE id=? AND status IN ('pending','awaiting_payment','payment_submitted')").bind(reference,oid),c.env.DB.prepare("INSERT INTO credit_ledger(id,company_id,delta,balance_after,entry_type,reference_id,description) VALUES(?,?,?,?,?,?,?)").bind(id(),o.company_id,o.credits,next,"purchase",oid,"Credit package approved by super admin")]);await audit(c,u,"billing.order.approve",oid);return c.json({ok:true,balance:next,order_id:oid,status:"paid"})}catch(e:any){return c.json({error:"order_approve_failed",detail:String(e?.message||e)},500)}});
 app.post("/api/admin/orders/:id/reject",requireAuth,async c=>{try{const u=c.get("user") as AuthUser;if(u.role!=="admin")return c.json({error:"admin_required"},403);await ensureCommercialSchema(c.env.DB);const oid=c.req.param("id");const body=await c.req.json<any>().catch(()=>({}));const reason=String(body.reason||"Rejected by Super Admin").trim().slice(0,500);const o=await c.env.DB.prepare("SELECT id,status FROM credit_orders WHERE id=? LIMIT 1").bind(oid).first<any>();if(!o)return c.json({error:"order_not_found"},404);if(o.status==='paid')return c.json({error:"order_already_paid"},409);if(o.status==='rejected')return c.json({ok:true,already_rejected:true});await c.env.DB.prepare("UPDATE credit_orders SET status='rejected',payment_reference=? WHERE id=? AND status IN ('pending','awaiting_payment','payment_submitted')").bind("REJECTED: "+reason,oid).run();await audit(c,u,"billing.order.reject",oid);return c.json({ok:true,order_id:oid,status:"rejected",reason})}catch(e:any){return c.json({error:"order_reject_failed",detail:String(e?.message||e)},500)}});
 
-app.get("/api/dashboard",async c=>{try{const u=c.get("user") as AuthUser;if(!u.company_id)return c.json({error:"company_id_missing"},403);const [j,ca,a]=await Promise.all([c.env.DB.prepare("SELECT COUNT(*) count FROM jobs WHERE company_id=?").bind(u.company_id).first<any>(),c.env.DB.prepare("SELECT COUNT(*) count FROM users WHERE company_id=? AND role='candidate'").bind(u.company_id).first<any>(),c.env.DB.prepare("SELECT COUNT(*) count FROM applications a JOIN jobs j ON j.id=a.job_id WHERE j.company_id=?").bind(u.company_id).first<any>()]);return c.json({jobs:Number(j?.count||0),candidates:Number(ca?.count||0),applications:Number(a?.count||0),strong_matches:0})}catch(e:any){return c.json({error:"dashboard_query_failed",detail:String(e?.message||e)},500)}});
+app.get("/api/dashboard",async c=>{try{const u=c.get("user") as AuthUser;if(!u)return c.json({error:"company_id_missing"},403);const companyId=await effectiveCompanyId(c.env.DB,u);const [j,ca,a]=await Promise.all([c.env.DB.prepare("SELECT COUNT(*) count FROM jobs WHERE company_id=? AND COALESCE(status,'open')<>'deleted'").bind(companyId).first<any>(),c.env.DB.prepare("SELECT COUNT(*) count FROM users WHERE company_id=? AND role='candidate'").bind(companyId).first<any>(),c.env.DB.prepare("SELECT COUNT(*) count FROM applications a JOIN jobs j ON j.id=a.job_id WHERE j.company_id=?").bind(companyId).first<any>()]);return c.json({jobs:Number(j?.count||0),candidates:Number(ca?.count||0),applications:Number(a?.count||0),strong_matches:0,company_id:companyId})}catch(e:any){return c.json({error:"dashboard_query_failed",detail:String(e?.message||e)},500)}});
 app.get("/api/jobs",async c=>{
   try{
     const u=await currentUser(c);
     if(!u)return c.json({error:"unauthorized",stage:"job_auth",cookie_present:!!cookieToken(c.req.raw)},401);
     if(!u.company_id)return c.json({error:"company_context_missing"},400);
+    const companyId=await effectiveCompanyId(c.env.DB,u);
     const rows=await c.env.DB.prepare(
       "SELECT id,title,location,salary,description,status,created_at FROM jobs WHERE company_id=? AND COALESCE(status,'open')<>'deleted' ORDER BY created_at DESC"
-    ).bind(u.company_id).all();
+    ).bind(companyId).all();
     return c.json(rows.results||[]);
   }catch(e:any){
     return c.json({error:"job_list_failed",detail:String(e?.message||e)},500);
@@ -394,7 +404,8 @@ app.patch("/api/jobs/:id",async c=>{
     if(!u.company_id)return c.json({error:"company_context_missing"},400);
     if(u.role!=="company"&&u.role!=="admin")return c.json({error:"company_role_required",stage:"job_auth",role:u.role},403);
     const jid=c.req.param("id");
-    const existing=await c.env.DB.prepare("SELECT id,title,location,salary,description,status FROM jobs WHERE id=? AND company_id=? LIMIT 1").bind(jid,u.company_id).first<any>();
+    const companyId=await effectiveCompanyId(c.env.DB,u);
+    const existing=await c.env.DB.prepare("SELECT id,title,location,salary,description,status FROM jobs WHERE id=? AND company_id=? LIMIT 1").bind(jid,companyId).first<any>();
     if(!existing||existing.status==='deleted')return c.json({error:"job_not_found"},404);
     const b=await c.req.json<any>();
     const title=String(b.title??existing.title??"").trim();
@@ -404,7 +415,7 @@ app.patch("/api/jobs/:id",async c=>{
     const requirements=Array.isArray(b.requirements)?b.requirements.map((x:any)=>String(x).trim()).filter(Boolean):[];
     if(!title||!description)return c.json({error:"title,description_required"},400);
     const finalDescription=description.replace(/\n\nRequired skills:\n(?:- .*\n?)+$/i,"").trim() + (requirements.length?"\n\nRequired skills:\n"+requirements.map((x:string)=>"- "+x).join("\n"):"");
-    await c.env.DB.prepare("UPDATE jobs SET title=?,location=?,salary=?,description=? WHERE id=? AND company_id=?").bind(title,location,salary,finalDescription,jid,u.company_id).run();
+    await c.env.DB.prepare("UPDATE jobs SET title=?,location=?,salary=?,description=? WHERE id=? AND company_id=?").bind(title,location,salary,finalDescription,jid,companyId).run();
     await audit(c,u,"job.update",jid);
     return c.json({ok:true,id:jid,title,location,salary,description:finalDescription,status:existing.status||'open'});
   }catch(e:any){
@@ -419,10 +430,11 @@ app.delete("/api/jobs/:id",async c=>{
     if(!u.company_id)return c.json({error:"company_context_missing"},400);
     if(u.role!=="company"&&u.role!=="admin")return c.json({error:"company_role_required",stage:"job_auth",role:u.role},403);
     const jid=c.req.param("id");
-    const existing=await c.env.DB.prepare("SELECT id,title,status FROM jobs WHERE id=? AND company_id=? LIMIT 1").bind(jid,u.company_id).first<any>();
+    const companyId=await effectiveCompanyId(c.env.DB,u);
+    const existing=await c.env.DB.prepare("SELECT id,title,status FROM jobs WHERE id=? AND company_id=? LIMIT 1").bind(jid,companyId).first<any>();
     if(!existing||existing.status==='deleted')return c.json({error:"job_not_found"},404);
     // Soft delete: keep applications/screening history intact while removing the job from the active workspace.
-    await c.env.DB.prepare("UPDATE jobs SET status='deleted' WHERE id=? AND company_id=?").bind(jid,u.company_id).run();
+    await c.env.DB.prepare("UPDATE jobs SET status='deleted' WHERE id=? AND company_id=?").bind(jid,companyId).run();
     await audit(c,u,"job.delete",jid);
     return c.json({ok:true,id:jid,deleted:true});
   }catch(e:any){
@@ -500,6 +512,7 @@ app.get("/api/candidates",async c=>{
     if(!m.candidate)return c.json({error:"applications_missing_candidate_key"},500);
     const score=m.cs.has("ai_score")?"a.ai_score":m.cs.has("score")?"a.score":"NULL";
     const screened=m.cs.has("ai_screened_at")?"a.ai_screened_at":"NULL";
+    const companyId=await effectiveCompanyId(c.env.DB,u);
     const sql=`SELECT cu.id,cu.name candidate_name,cp.cv_url,cp.full_name,cp.headline,cp.summary,cp.skills,cp.current_position,cp.education,cp.experience_years,
       a.id application_id,a.job_id,j.title job_title,a.status,${score} score,${screened} screened_at,
       CASE WHEN COALESCE(TRIM(cp.skills),'')!='' OR COALESCE(TRIM(cp.summary),'')!='' OR COALESCE(TRIM(cp.current_position),'')!='' OR COALESCE(TRIM(cp.education),'')!='' OR COALESCE(cp.experience_years,0)>0 THEN 1 ELSE 0 END extraction_ready
@@ -509,7 +522,7 @@ app.get("/api/candidates",async c=>{
       LEFT JOIN jobs j ON j.id=a.job_id
       WHERE cu.company_id=? AND cu.role='candidate' AND (j.status IS NULL OR j.status!='deleted')
       ORDER BY cu.created_at DESC`;
-    return c.json((await c.env.DB.prepare(sql).bind(u.company_id).all()).results||[]);
+    return c.json((await c.env.DB.prepare(sql).bind(companyId).all()).results||[]);
   }catch(e:any){
     return c.json({error:"candidates_query_failed",detail:String(e?.message||e)},500);
   }
