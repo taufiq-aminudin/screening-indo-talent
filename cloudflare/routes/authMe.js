@@ -30,14 +30,13 @@ export default async function handleAuthMe(request) {
     "HMAC",
     key,
     Buffer.from(signature, "hex"),
-    encoder.encode(email) // bisa ditambah timestamp jika ingin lebih ketat
+    encoder.encode(email) // bisa ditambah timestamp untuk lebih ketat
   );
 
   if (!valid) {
     return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 });
   }
 
-  // Jika valid, kembalikan info Super Admin
   return new Response(JSON.stringify({
     email,
     role: "super-admin",
