@@ -128,15 +128,80 @@ async function currentUser(c:any):Promise<AuthUser|null>{
       };
     }
     const row=await c.env.DB.prepare(
-      "SELECT u.id,u.company_id,u.name,u.email,u.role,COALESCE(cp.company_name,u.name) company_name " +
-      "FROM users u LEFT JOIN company_profiles cp ON cp.user_id=u.company_id " +
-      "WHERE u.id=? LIMIT 1"
+      "SELECT u.id,u.company_id,u.name,u.email,u.role,COALESCE((SELECT company_name FROM company_profiles WHERE user_id=u.company_id LIMIT 1),(SELECT company_name FROM company_profiles WHERE user_id=u.id LIMIT 1),u.name) company_name " +
+      "FROM users u WHERE u.id=? LIMIT 1"
     ).bind(session.user_id).first<AuthUser>();
     return row||null;
   }catch(e:any){
     throw new Error("session_lookup_failed: "+String(e?.message||e));
   }
 }
+function ident(v:string){return /^[A-Za-z_][A-Za-z0-9_]*$/.test(v)?v:null}
+async function tableColumns(db:D1Database,table:string){
+  const t=ident(table); if(!t) return [] as any[];
+  const r=await db.prepare(`PRAGMA table_info(${t})`).all<any>();
+  return (r.results||[]);
+}
+async function resolveJobCompanyId(db:D1Database,u:AuthUser):Promise<{companyId:string;parentTable:string;parentColumn:string;repaired:boolean}> {
+  const fks=await db.prepare("PRAGMA foreign_key_list(jobs)").all<any>();
+  const fk=(fks.results||[]).find((x:any)=>String(x.from||"")==="company_id") as any;
+  const parentTable=String(fk?.table||"users");
+  const parentColumn=String(fk?.to||"id");
+  const cols=await tableColumns(db,parentTable);
+  const colNames=new Set(cols.map((x:any)=>String(x.name)));
+  const safeParent=ident(parentTable), safeColumn=ident(parentColumn);
+  if(!safeParent||!safeColumn) throw new Error("job_company_fk_schema_invalid");
+
+  const profile=await db.prepare("SELECT company_name,legal_name,contact_name,contact_email,email FROM company_profiles WHERE user_id=? LIMIT 1").bind(u.company_id||u.id).first<any>().catch(()=>null);
+  const companyName=String(profile?.company_name||profile?.legal_name||u.company_name||u.name||"").trim();
+  const candidates=[String(u.company_id||""),String(u.id||"")].filter(Boolean);
+
+  // Fast path: the current/stable account identifiers are already valid FK targets.
+  for(const value of [...new Set(candidates)]){
+    const hit=await db.prepare(`SELECT ${safeColumn} AS id FROM ${safeParent} WHERE ${safeColumn}=? LIMIT 1`).bind(value).first<any>().catch(()=>null);
+    if(hit?.id!=null) return {companyId:String(hit.id),parentTable,parentColumn,repaired:String(hit.id)!==String(u.company_id),};
+  }
+
+  // Older schemas may use companies.id (or another tenant table) and link it to the
+  // company account through user_id/owner_id/account_id/email/name. Resolve that row.
+  const linkCols=["user_id","owner_id","account_id","company_account_id","created_by","created_by_user_id","contact_email","email","registration_number"]
+    .filter(x=>colNames.has(x));
+  for(const lc of linkCols){
+    const vals=lc.includes("email")?[u.email]:candidates;
+    for(const value of vals){
+      if(!value) continue;
+      const hit=await db.prepare(`SELECT ${safeColumn} AS id FROM ${safeParent} WHERE ${ident(lc)}=? LIMIT 1`).bind(value).first<any>().catch(()=>null);
+      if(hit?.id!=null) return {companyId:String(hit.id),parentTable,parentColumn,repaired:true};
+    }
+  }
+  for(const nc of ["company_name","name","legal_name"]){
+    if(!colNames.has(nc)||!companyName) continue;
+    const hit=await db.prepare(`SELECT ${safeColumn} AS id FROM ${safeParent} WHERE lower(${ident(nc)})=lower(?) LIMIT 1`).bind(companyName).first<any>().catch(()=>null);
+    if(hit?.id!=null) return {companyId:String(hit.id),parentTable,parentColumn,repaired:true};
+  }
+
+  // If jobs points at a tenant/company table and no row exists, create the minimum
+  // company record from the existing company profile. Only fill columns that are
+  // known, non-generated, and have sensible values/defaults.
+  if(parentTable!=="users" && parentTable!=="company_profiles"){
+    const insertCols:string[]=[]; const insertVals:any[]=[];
+    const add=(name:string,value:any)=>{if(colNames.has(name)&&!insertCols.includes(name)){insertCols.push(name);insertVals.push(value)}};
+    const pk=cols.find((x:any)=>Number(x.pk)===1);
+    if(pk) add(String(pk.name), String(u.company_id||id())); else if(colNames.has(parentColumn)) add(parentColumn,String(u.company_id||id()));
+    add("user_id",u.id); add("owner_id",u.id); add("account_id",u.id); add("company_account_id",u.id); add("created_by",u.id); add("created_by_user_id",u.id);
+    add("company_name",companyName); add("name",companyName); add("legal_name",String(profile?.legal_name||companyName));
+    add("contact_name",String(profile?.contact_name||u.name)); add("contact_email",String(profile?.contact_email||profile?.email||u.email)); add("email",String(profile?.email||u.email));
+    add("created_at",new Date().toISOString()); add("updated_at",new Date().toISOString()); add("status","active");
+    const requiredMissing=cols.filter((x:any)=>Number(x.notnull)===1&&!x.dflt_value&&Number(x.pk)!==1&&!insertCols.includes(String(x.name)));
+    if(requiredMissing.length===0 && insertCols.length){
+      await db.prepare(`INSERT INTO ${safeParent}(${insertCols.join(",")}) VALUES(${insertCols.map(()=>"?").join(",")})`).bind(...insertVals).run();
+      const created=await db.prepare(`SELECT ${safeColumn} AS id FROM ${safeParent} WHERE ${safeColumn}=? LIMIT 1`).bind(insertVals[insertCols.indexOf(parentColumn)]??u.company_id).first<any>().catch(()=>null);
+      if(created?.id!=null) return {companyId:String(created.id),parentTable,parentColumn,repaired:true};
+    }
+  }
+  throw new Error(`job_company_fk_unresolved:${parentTable}.${parentColumn}`);
+}
+
 async function requireAuth(c:any,next:any){
   try{
     const u=await currentUser(c);
@@ -171,7 +236,7 @@ async function ensureWallet(db:D1Database,companyId:string){
 
 async function appMeta(db:D1Database){const cs=await columns(db,"applications");return {cs,candidate:cs.has("candidate_id")?"candidate_id":cs.has("user_id")?"user_id":null,tenant:cs.has("company_id")?"company_id":cs.has("organization_id")?"organization_id":null}}
 async function createApplication(c:any,u:AuthUser,jobId:string,candidateUserId:string){const m=await appMeta(c.env.DB);if(!m.candidate)throw new Error("applications_missing_candidate_key");const f=["id","job_id",m.candidate],v:any[]=[id(),jobId,candidateUserId];if(m.tenant){f.push(m.tenant);v.push(u.company_id)}if(m.cs.has("status")){f.push("status");v.push("Review")}if(m.cs.has("score")){f.push("score");v.push(0)}await c.env.DB.prepare(`INSERT INTO applications(${f.join(",")}) VALUES(${f.map(()=>"?").join(",")})`).bind(...v).run()}
-app.get("/api/health",async c=>{try{await c.env.DB.prepare("SELECT 1").first();return c.json({ok:true,app:c.env.APP_NAME,version:"v6.36-profile-superadmin-commercial",database:"indo-talent-db",storage:"r2"})}catch{return c.json({ok:false,error:"database_unavailable"},503)}});
+app.get("/api/health",async c=>{try{await c.env.DB.prepare("SELECT 1").first();return c.json({ok:true,app:c.env.APP_NAME,version:"v6.37-company-context-fk-repair",database:"indo-talent-db",storage:"r2"})}catch{return c.json({ok:false,error:"database_unavailable"},503)}});
 app.post("/api/auth/register",async c=>{
   try{
     const b=await c.req.json<any>();
@@ -260,7 +325,7 @@ for(const p of ["/api/candidates","/api/applications","/api/dashboard","/api/scr
 app.get("/api/profile",requireAuth,async c=>{
   try{
     const u=c.get("user") as AuthUser;
-    const r=await c.env.DB.prepare("SELECT company_name,industry,address,website,description,logo_url,legal_name,registration_number,email,phone,city,province,postal_code,country,contact_name,contact_email,contact_phone,verified,created_at,updated_at FROM company_profiles WHERE user_id=? LIMIT 1").bind(u.company_id).first<any>();
+    const r=await c.env.DB.prepare("SELECT company_name,industry,address,website,description,logo_url,legal_name,registration_number,email,phone,city,province,postal_code,country,contact_name,contact_email,contact_phone,verified,created_at,updated_at FROM company_profiles WHERE user_id=? OR user_id=? ORDER BY CASE WHEN user_id=? THEN 0 ELSE 1 END LIMIT 1").bind(u.company_id,u.id,u.company_id).first<any>();
     return c.json({user:u,profile:r||{company_name:u.company_name,contact_name:u.name,contact_email:u.email}});
   }catch(e:any){return c.json({error:"profile_load_failed",detail:String(e?.message||e)},500)}
 });
@@ -395,40 +460,34 @@ app.post("/api/jobs",async c=>{
       : description;
 
     const jid=id();
-    // Resolve the tenant/company key from the authenticated user before inserting.
-    // Some older company accounts can carry a stale company_id; jobs.company_id has a
-    // foreign-key constraint, so blindly inserting that value causes SQLITE_CONSTRAINT_FOREIGNKEY.
-    const ur=await c.env.DB.prepare("SELECT id,company_id FROM users WHERE id=? LIMIT 1").bind(u.id).first<any>();
-    const candidates=[String(u.company_id||""),String(ur?.company_id||""),String(ur?.id||u.id)].filter(Boolean);
-    const unique=[...new Set(candidates)];
-    let insertedCompanyId="";
-    let lastError:any=null;
-    for(const companyId of unique){
-      try{
-        await c.env.DB.prepare(
-          "INSERT INTO jobs(id,company_id,title,location,salary,description,status,created_at) VALUES(?,?,?,?,?,?,?,CURRENT_TIMESTAMP)"
-        ).bind(jid,companyId,title,location,salary,finalDescription,"open").run();
-        insertedCompanyId=companyId;
-        break;
-      }catch(e:any){
-        lastError=e;
-        const msg=String(e?.message||e);
-        if(!/FOREIGN KEY|SQLITE_CONSTRAINT_FOREIGNKEY/i.test(msg)) throw e;
-      }
-    }
-    if(!insertedCompanyId){
+    // Resolve the actual parent of jobs.company_id from the live schema. This fixes
+    // accounts created under older schema versions where users.company_id may point
+    // to a user/account key while jobs.company_id references a dedicated company row.
+    let companyCtx:{companyId:string;parentTable:string;parentColumn:string;repaired:boolean};
+    try{
+      companyCtx=await resolveJobCompanyId(c.env.DB,u);
+    }catch(e:any){
       return c.json({
         error:"job_company_context_invalid",
         detail:"Company account is not linked to a valid company record. Please refresh the company profile or contact the administrator.",
         user_id:u.id,
         company_id:u.company_id||null,
-        tried_company_ids:unique,
-        cause:String(lastError?.message||lastError||"unknown")
+        cause:String(e?.message||e||"unknown")
       },409);
     }
+    const insertedCompanyId=companyCtx.companyId;
+    await c.env.DB.prepare(
+      "INSERT INTO jobs(id,company_id,title,location,salary,description,status,created_at) VALUES(?,?,?,?,?,?,?,CURRENT_TIMESTAMP)"
+    ).bind(jid,insertedCompanyId,title,location,salary,finalDescription,"open").run();
 
+    // Keep the tenant context consistent for the rest of the ATS when a legacy account
+    // was repaired to a dedicated company/tenant row.
+    if(companyCtx.repaired && companyCtx.parentTable!=="users"){
+      try{await c.env.DB.prepare("UPDATE users SET company_id=? WHERE id=?").bind(insertedCompanyId,u.id).run()}catch{}
+      u.company_id=insertedCompanyId;
+    }
     await audit(c,{...u,company_id:insertedCompanyId},"job.create",jid);
-    return c.json({ok:true,id:jid,title,company_id:insertedCompanyId},201);
+    return c.json({ok:true,id:jid,title,company_id:insertedCompanyId,company_context_repaired:companyCtx.repaired},201);
   }catch(e:any){
     return c.json({error:"job_create_failed",detail:String(e?.message||e)},500);
   }
