@@ -103,31 +103,12 @@ async function createAdminSession(c:any,email:string){
   const payload=b64url(enc.encode(JSON.stringify({sub:"super-admin",email,exp:Math.floor(Date.now()/1000)+7*86400,iat:Math.floor(Date.now()/1000)})));
   const key=await adminSigningKey(c);
   const sig=b64url(new Uint8Array(await crypto.subtle.sign("HMAC",key,enc.encode(payload))));
-  const token=`${payload}.${sig}`;
-  c.header("Set-Cookie",adminCookie(token,7*86400));
-  return token;
+  c.header("Set-Cookie",adminCookie(`${payload}.${sig}`,7*86400));
 }
 async function currentAdminCookie(c:any):Promise<AuthUser|null>{
   const h=c.req.raw.headers.get("Cookie")||"";
   const token=h.match(/(?:^|;\s*)ats_admin=([^;]+)/)?.[1];
   if(!token)return null;
-  return verifyAdminToken(c,token);
-}
-async function columns(db:D1Database,table:string){const r=await db.prepare(`PRAGMA table_info(${table})`).all<any>();return new Set((r.results||[]).map((x:any)=>String(x.name)))}
-async function createSession(c:any,u:AuthUser){
-  const token=b64url(crypto.getRandomValues(new Uint8Array(32)));
-  const expires=new Date(Date.now()+7*86400000).toISOString();
-  await c.env.DB.prepare("INSERT INTO sessions(token,user_id,expires_at) VALUES(?,?,?)")
-    .bind(await sha256(token),u.id,expires).run();
-  c.header("Set-Cookie",setCookie(token,7*86400));
-  return token;
-}
-function bearerToken(req:Request){
-  const direct=req.headers.get("Authorization")||req.headers.get("X-Auth-Token")||req.headers.get("X-Admin-Token")||req.headers.get("X-Session-Token")||"";
-  const m=direct.match(/^Bearer\s+(.+)$/i);
-  return m?.[1]?.trim()||direct.trim()||null;
-}
-async function verifyAdminToken(c:any,token:string):Promise<AuthUser|null>{
   try{
     const [payload,sig]=token.split(".");
     if(!payload||!sig)return null;
@@ -144,25 +125,15 @@ async function verifyAdminToken(c:any,token:string):Promise<AuthUser|null>{
     return {id:"super-admin",company_id:"platform",name:"Super Admin",email:cfg.email,role:"admin",company_name:"AI Screening Platform"};
   }catch{return null}
 }
+async function columns(db:D1Database,table:string){const r=await db.prepare(`PRAGMA table_info(${table})`).all<any>();return new Set((r.results||[]).map((x:any)=>String(x.name)))}
+async function createSession(c:any,u:AuthUser){
+  const token=b64url(crypto.getRandomValues(new Uint8Array(32)));
+  const expires=new Date(Date.now()+7*86400000).toISOString();
+  await c.env.DB.prepare("INSERT INTO sessions(token,user_id,expires_at) VALUES(?,?,?)")
+    .bind(await sha256(token),u.id,expires).run();
+  c.header("Set-Cookie",setCookie(token,7*86400));
+}
 async function currentUser(c:any):Promise<AuthUser|null>{
-  const bearer=bearerToken(c.req.raw);
-  if(bearer){
-    const admin=await verifyAdminToken(c,bearer);
-    if(admin)return admin;
-    try{
-      const tokenHash=await sha256(bearer);
-      const session=await c.env.DB.prepare("SELECT user_id FROM sessions WHERE token=? AND expires_at>CURRENT_TIMESTAMP LIMIT 1").bind(tokenHash).first<any>();
-      if(session){
-        if(session.user_id==="super-admin"){
-          const cfg=adminConfig(c);
-          if(cfg.email)return {id:"super-admin",company_id:"platform",name:"Super Admin",email:cfg.email,role:"admin",company_name:"AI Screening Platform"};
-        }else{
-          const row=await c.env.DB.prepare("SELECT u.id,u.company_id,u.name,u.email,u.role,COALESCE(cp.company_name,u.name) company_name FROM users u LEFT JOIN company_profiles cp ON cp.user_id=u.company_id WHERE u.id=? LIMIT 1").bind(session.user_id).first<AuthUser>();
-          if(row)return row;
-        }
-      }
-    }catch(e:any){throw new Error("session_lookup_failed: "+String(e?.message||e))}
-  }
   const admin=await currentAdminCookie(c);
   if(admin)return admin;
   const raw=cookieToken(c.req.raw);
@@ -176,31 +147,25 @@ async function currentUser(c:any):Promise<AuthUser|null>{
     if(session.user_id==="super-admin"){
       const cfg=adminConfig(c);
       if(!cfg.email)return null;
-      return {id:"super-admin",company_id:"platform",name:"Super Admin",email:cfg.email,role:"admin",company_name:"AI Screening Platform"};
+      return {
+        id:"super-admin",
+        company_id:"platform",
+        name:"Super Admin",
+        email:cfg.email,
+        role:"admin",
+        company_name:"AI Screening Platform"
+      };
     }
     const row=await c.env.DB.prepare(
       "SELECT u.id,u.company_id,u.name,u.email,u.role,COALESCE(cp.company_name,u.name) company_name " +
-      "FROM users u LEFT JOIN company_profiles cp ON cp.user_id=u.company_id WHERE u.id=? LIMIT 1"
+      "FROM users u LEFT JOIN company_profiles cp ON cp.user_id=u.company_id " +
+      "WHERE u.id=? LIMIT 1"
     ).bind(session.user_id).first<AuthUser>();
     return row||null;
   }catch(e:any){
     throw new Error("session_lookup_failed: "+String(e?.message||e));
   }
 }
-async function companyScopeIds(db:D1Database,u:AuthUser):Promise<string[]>{
-  const ids:string[]=[];
-  const add=(v:any)=>{const x=String(v??"").trim();if(x&&!ids.includes(x))ids.push(x)};
-  add(u.company_id);
-  add(u.id);
-  try{
-    const r=await db.prepare("SELECT id,company_id FROM users WHERE id=? LIMIT 1").bind(u.id).first<any>();
-    add(r?.company_id);
-    add(r?.id);
-  }catch{}
-  return ids;
-}
-function scopePlaceholders(ids:string[]){return ids.map(()=>"?").join(",")}
-
 async function requireAuth(c:any,next:any){
   try{
     const u=await currentUser(c);
@@ -235,7 +200,7 @@ async function ensureWallet(db:D1Database,companyId:string){
 
 async function appMeta(db:D1Database){const cs=await columns(db,"applications");return {cs,candidate:cs.has("candidate_id")?"candidate_id":cs.has("user_id")?"user_id":null,tenant:cs.has("company_id")?"company_id":cs.has("organization_id")?"organization_id":null}}
 async function createApplication(c:any,u:AuthUser,jobId:string,candidateUserId:string){const m=await appMeta(c.env.DB);if(!m.candidate)throw new Error("applications_missing_candidate_key");const f=["id","job_id",m.candidate],v:any[]=[id(),jobId,candidateUserId];if(m.tenant){f.push(m.tenant);v.push(u.company_id)}if(m.cs.has("status")){f.push("status");v.push("Review")}if(m.cs.has("score")){f.push("score");v.push(0)}await c.env.DB.prepare(`INSERT INTO applications(${f.join(",")}) VALUES(${f.map(()=>"?").join(",")})`).bind(...v).run()}
-app.get("/api/health",async c=>{try{await c.env.DB.prepare("SELECT 1").first();return c.json({ok:true,app:c.env.APP_NAME,version:"v6.36-profile-superadmin-commercial",database:"indo-talent-db",storage:"r2"})}catch{return c.json({ok:false,error:"database_unavailable"},503)}});
+app.get("/api/health",async c=>{try{await c.env.DB.prepare("SELECT 1").first();return c.json({ok:true,app:c.env.APP_NAME,version:"v6.61-auth-restored",database:"indo-talent-db",storage:"r2"})}catch{return c.json({ok:false,error:"database_unavailable"},503)}});
 app.post("/api/auth/register",async c=>{
   try{
     const b=await c.req.json<any>();
@@ -294,10 +259,10 @@ app.post("/api/auth/login",async c=>{
     if(!r)return c.json({error:"invalid_credentials"},401);
     if(!(await passwordVerify(password,r.password_hash)))return c.json({error:"invalid_credentials"},401);
     const u:AuthUser={id:r.id,company_id:r.company_id||r.id,name:r.name,email:r.email,role:r.role,company_name:r.company_name};
-    const session_token=await createSession(c,u);
+    await createSession(c,u);
     await audit(c,u,"auth.login",u.id);
     c.header("Cache-Control","no-store");
-    return c.json({user:u,session_token});
+    return c.json({user:u});
   }catch(e:any){
     return c.json({error:"login_failed",detail:String(e?.message||e)},500);
   }
@@ -946,7 +911,7 @@ app.post("/api/admin/login",async c=>{
       return c.json({
         error:"admin_not_configured",
         detail:"Super Admin credentials are not configured on this Worker deployment.",
-        config:{email_configured:emailConfigured,password_configured:Boolean(configuredPassword),password_hash_configured:Boolean(configuredHash),build:"V6.61-AUTH-FINAL"}
+        config:{email_configured:emailConfigured,password_configured:Boolean(configuredPassword),password_hash_configured:Boolean(configuredHash),build:"V6.61-AUTH-RESTORED"}
       },503);
     }
 
@@ -966,19 +931,18 @@ app.post("/api/admin/login",async c=>{
     const u:AuthUser={id:"super-admin",company_id:"platform",name:"Super Admin",email:configuredEmail,role:"admin",company_name:"AI Screening Platform"};
 
     stage.step="create_admin_cookie";
-    let admin_token="";
     try{
-      admin_token=await createAdminSession(c,configuredEmail);
+      await createAdminSession(c,configuredEmail);
     }catch(e:any){
-      return c.json({error:"admin_session_failed",detail:String(e?.message||e),stage:stage.step,build:"V6.61-AUTH-FINAL"},503);
+      return c.json({error:"admin_session_failed",detail:String(e?.message||e),stage:stage.step,build:"V6.61-AUTH-RESTORED"},503);
     }
 
     // Audit is deliberately best-effort and can never block authentication.
     stage.step="audit";
     await audit(c,u,"admin.login",u.id);
-    return c.json({user:u,admin_token,auth_source:"bootstrap_secret",build:"V6.61-AUTH-FINAL"});
+    return c.json({user:u,auth_source:"bootstrap_secret",build:"V6.61-AUTH-RESTORED"});
   }catch(e:any){
-    return c.json({error:"admin_login_failed",detail:String(e?.message||e),stage:stage.step,build:"V6.61-AUTH-FINAL"},500);
+    return c.json({error:"admin_login_failed",detail:String(e?.message||e),stage:stage.step,build:"V6.61-AUTH-RESTORED"},500);
   }
 });
 
