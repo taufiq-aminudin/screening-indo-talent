@@ -1,1 +1,18 @@
+name = "indo-talent-erp"
+main = "cloudflare/index.js"
+compatibility_date = "2026-08-26"
+
+# Environment variables (secrets)
+[vars]
+SUPER_ADMIN_EMAIL = "admin@indo-talent.my.id"
+SUPER_ADMIN_PASSWORD_HASH = "ganti_dengan_hash_password"
+SESSION_SECRET = "ganti_dengan_session_secret"
+
+# Worker routes
+[triggers]
+routes = ["https://screening.indo-talent.my.id/api/*"]
+
+# Build settings
+[build]
+command = "npm install && npm run build"
 
