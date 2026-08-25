@@ -211,6 +211,20 @@ async function effectiveCompanyId(db:D1Database,u:AuthUser):Promise<string>{
   return String(ctx.companyId);
 }
 
+// Legacy-safe tenant scope. Some older databases have jobs created with the
+// account id while newer rows use users.company_id or a dedicated company row.
+// Keep the canonical id first, but include the known account identifiers so
+// existing jobs remain visible after a company-context repair.
+async function companyContextIds(db:D1Database,u:AuthUser):Promise<string[]>{
+  if(u.role==='admin') return [String(u.company_id||'platform')];
+  const ids:string[]=[];
+  const add=(v:any)=>{const x=String(v??'').trim();if(x&&!ids.includes(x))ids.push(x)};
+  try{add(await effectiveCompanyId(db,u))}catch{}
+  add(u.company_id); add(u.id);
+  return ids;
+}
+function sqlIn(ids:string[]){return ids.map(()=>'?').join(',')}
+
 async function requireAuth(c:any,next:any){
   try{
     const u=await currentUser(c);
@@ -245,7 +259,7 @@ async function ensureWallet(db:D1Database,companyId:string){
 
 async function appMeta(db:D1Database){const cs=await columns(db,"applications");return {cs,candidate:cs.has("candidate_id")?"candidate_id":cs.has("user_id")?"user_id":null,tenant:cs.has("company_id")?"company_id":cs.has("organization_id")?"organization_id":null}}
 async function createApplication(c:any,u:AuthUser,jobId:string,candidateUserId:string){const m=await appMeta(c.env.DB);if(!m.candidate)throw new Error("applications_missing_candidate_key");const f=["id","job_id",m.candidate],v:any[]=[id(),jobId,candidateUserId];if(m.tenant){f.push(m.tenant);v.push(u.company_id)}if(m.cs.has("status")){f.push("status");v.push("Review")}if(m.cs.has("score")){f.push("score");v.push(0)}await c.env.DB.prepare(`INSERT INTO applications(${f.join(",")}) VALUES(${f.map(()=>"?").join(",")})`).bind(...v).run()}
-app.get("/api/health",async c=>{try{await c.env.DB.prepare("SELECT 1").first();return c.json({ok:true,app:c.env.APP_NAME,version:"v6.37-company-context-fk-repair",database:"indo-talent-db",storage:"r2"})}catch{return c.json({ok:false,error:"database_unavailable"},503)}});
+app.get("/api/health",async c=>{try{await c.env.DB.prepare("SELECT 1").first();return c.json({ok:true,app:c.env.APP_NAME,version:"v6.39-company-context-multi-id-fix",database:"indo-talent-db",storage:"r2"})}catch{return c.json({ok:false,error:"database_unavailable"},503)}});
 app.post("/api/auth/register",async c=>{
   try{
     const b=await c.req.json<any>();
@@ -381,16 +395,17 @@ app.get("/api/admin/orders",requireAuth,async c=>{try{const u=c.get("user") as A
 app.post("/api/admin/orders/:id/approve",requireAuth,async c=>{try{const u=c.get("user") as AuthUser;if(u.role!=="admin")return c.json({error:"admin_required"},403);await ensureCommercialSchema(c.env.DB);const oid=c.req.param("id");const body=await c.req.json<any>().catch(()=>({}));const o=await c.env.DB.prepare("SELECT * FROM credit_orders WHERE id=? LIMIT 1").bind(oid).first<any>();if(!o)return c.json({error:"order_not_found"},404);if(o.status==='paid')return c.json({ok:true,already_paid:true});if(!['pending','awaiting_payment','payment_submitted'].includes(String(o.status)))return c.json({error:"order_not_pending",status:o.status},409);if(!o.payment_proof_key)return c.json({error:"payment_proof_required",detail:"Super Admin hanya dapat approve setelah bukti transfer di-upload oleh company."},400);const w=await ensureWallet(c.env.DB,o.company_id);const next=Number(w?.balance||0)+Number(o.credits||0);const reference=String(body.payment_reference||("ADMIN-"+u.id)).trim().slice(0,120);await c.env.DB.batch([c.env.DB.prepare("UPDATE credit_wallets SET balance=?,lifetime_purchased=lifetime_purchased+?,updated_at=CURRENT_TIMESTAMP WHERE company_id=?").bind(next,o.credits,o.company_id),c.env.DB.prepare("UPDATE credit_orders SET status='paid',payment_reference=?,paid_at=CURRENT_TIMESTAMP WHERE id=? AND status IN ('pending','awaiting_payment','payment_submitted')").bind(reference,oid),c.env.DB.prepare("INSERT INTO credit_ledger(id,company_id,delta,balance_after,entry_type,reference_id,description) VALUES(?,?,?,?,?,?,?)").bind(id(),o.company_id,o.credits,next,"purchase",oid,"Credit package approved by super admin")]);await audit(c,u,"billing.order.approve",oid);return c.json({ok:true,balance:next,order_id:oid,status:"paid"})}catch(e:any){return c.json({error:"order_approve_failed",detail:String(e?.message||e)},500)}});
 app.post("/api/admin/orders/:id/reject",requireAuth,async c=>{try{const u=c.get("user") as AuthUser;if(u.role!=="admin")return c.json({error:"admin_required"},403);await ensureCommercialSchema(c.env.DB);const oid=c.req.param("id");const body=await c.req.json<any>().catch(()=>({}));const reason=String(body.reason||"Rejected by Super Admin").trim().slice(0,500);const o=await c.env.DB.prepare("SELECT id,status FROM credit_orders WHERE id=? LIMIT 1").bind(oid).first<any>();if(!o)return c.json({error:"order_not_found"},404);if(o.status==='paid')return c.json({error:"order_already_paid"},409);if(o.status==='rejected')return c.json({ok:true,already_rejected:true});await c.env.DB.prepare("UPDATE credit_orders SET status='rejected',payment_reference=? WHERE id=? AND status IN ('pending','awaiting_payment','payment_submitted')").bind("REJECTED: "+reason,oid).run();await audit(c,u,"billing.order.reject",oid);return c.json({ok:true,order_id:oid,status:"rejected",reason})}catch(e:any){return c.json({error:"order_reject_failed",detail:String(e?.message||e)},500)}});
 
-app.get("/api/dashboard",async c=>{try{const u=c.get("user") as AuthUser;if(!u)return c.json({error:"company_id_missing"},403);const companyId=await effectiveCompanyId(c.env.DB,u);const [j,ca,a]=await Promise.all([c.env.DB.prepare("SELECT COUNT(*) count FROM jobs WHERE company_id=? AND COALESCE(status,'open')<>'deleted'").bind(companyId).first<any>(),c.env.DB.prepare("SELECT COUNT(*) count FROM users WHERE company_id=? AND role='candidate'").bind(companyId).first<any>(),c.env.DB.prepare("SELECT COUNT(*) count FROM applications a JOIN jobs j ON j.id=a.job_id WHERE j.company_id=?").bind(companyId).first<any>()]);return c.json({jobs:Number(j?.count||0),candidates:Number(ca?.count||0),applications:Number(a?.count||0),strong_matches:0,company_id:companyId})}catch(e:any){return c.json({error:"dashboard_query_failed",detail:String(e?.message||e)},500)}});
+app.get("/api/dashboard",async c=>{try{const u=c.get("user") as AuthUser;if(!u)return c.json({error:"company_id_missing"},403);const companyIds=await companyContextIds(c.env.DB,u);if(!companyIds.length)return c.json({jobs:0,candidates:0,applications:0,strong_matches:0,company_id:null,company_ids:[]});const ph=sqlIn(companyIds);const [j,ca,a]=await Promise.all([c.env.DB.prepare(`SELECT COUNT(*) count FROM jobs WHERE company_id IN (${ph}) AND COALESCE(status,'open')<>'deleted'`).bind(...companyIds).first<any>(),c.env.DB.prepare(`SELECT COUNT(*) count FROM users WHERE company_id IN (${ph}) AND role='candidate'`).bind(...companyIds).first<any>(),c.env.DB.prepare(`SELECT COUNT(*) count FROM applications a JOIN jobs j ON j.id=a.job_id WHERE j.company_id IN (${ph})`).bind(...companyIds).first<any>()]);return c.json({jobs:Number(j?.count||0),candidates:Number(ca?.count||0),applications:Number(a?.count||0),strong_matches:0,company_id:companyIds[0],company_ids:companyIds})}catch(e:any){return c.json({error:"dashboard_query_failed",detail:String(e?.message||e)},500)}});
 app.get("/api/jobs",async c=>{
   try{
     const u=await currentUser(c);
     if(!u)return c.json({error:"unauthorized",stage:"job_auth",cookie_present:!!cookieToken(c.req.raw)},401);
     if(!u.company_id)return c.json({error:"company_context_missing"},400);
-    const companyId=await effectiveCompanyId(c.env.DB,u);
+    const companyIds=await companyContextIds(c.env.DB,u);
+    if(!companyIds.length)return c.json([]);
     const rows=await c.env.DB.prepare(
-      "SELECT id,title,location,salary,description,status,created_at FROM jobs WHERE company_id=? AND COALESCE(status,'open')<>'deleted' ORDER BY created_at DESC"
-    ).bind(companyId).all();
+      `SELECT id,title,location,salary,description,status,created_at FROM jobs WHERE company_id IN (${sqlIn(companyIds)}) AND COALESCE(status,'open')<>'deleted' ORDER BY created_at DESC`
+    ).bind(...companyIds).all();
     return c.json(rows.results||[]);
   }catch(e:any){
     return c.json({error:"job_list_failed",detail:String(e?.message||e)},500);
@@ -404,8 +419,9 @@ app.patch("/api/jobs/:id",async c=>{
     if(!u.company_id)return c.json({error:"company_context_missing"},400);
     if(u.role!=="company"&&u.role!=="admin")return c.json({error:"company_role_required",stage:"job_auth",role:u.role},403);
     const jid=c.req.param("id");
-    const companyId=await effectiveCompanyId(c.env.DB,u);
-    const existing=await c.env.DB.prepare("SELECT id,title,location,salary,description,status FROM jobs WHERE id=? AND company_id=? LIMIT 1").bind(jid,companyId).first<any>();
+    const companyIds=await companyContextIds(c.env.DB,u);
+    if(!companyIds.length)return c.json({error:"company_context_missing"},400);
+    const existing=await c.env.DB.prepare(`SELECT id,title,location,salary,description,status FROM jobs WHERE id=? AND company_id IN (${sqlIn(companyIds)}) LIMIT 1`).bind(jid,...companyIds).first<any>();
     if(!existing||existing.status==='deleted')return c.json({error:"job_not_found"},404);
     const b=await c.req.json<any>();
     const title=String(b.title??existing.title??"").trim();
@@ -415,7 +431,7 @@ app.patch("/api/jobs/:id",async c=>{
     const requirements=Array.isArray(b.requirements)?b.requirements.map((x:any)=>String(x).trim()).filter(Boolean):[];
     if(!title||!description)return c.json({error:"title,description_required"},400);
     const finalDescription=description.replace(/\n\nRequired skills:\n(?:- .*\n?)+$/i,"").trim() + (requirements.length?"\n\nRequired skills:\n"+requirements.map((x:string)=>"- "+x).join("\n"):"");
-    await c.env.DB.prepare("UPDATE jobs SET title=?,location=?,salary=?,description=? WHERE id=? AND company_id=?").bind(title,location,salary,finalDescription,jid,companyId).run();
+    await c.env.DB.prepare(`UPDATE jobs SET title=?,location=?,salary=?,description=? WHERE id=? AND company_id IN (${sqlIn(companyIds)})`).bind(title,location,salary,finalDescription,jid,...companyIds).run();
     await audit(c,u,"job.update",jid);
     return c.json({ok:true,id:jid,title,location,salary,description:finalDescription,status:existing.status||'open'});
   }catch(e:any){
@@ -430,11 +446,12 @@ app.delete("/api/jobs/:id",async c=>{
     if(!u.company_id)return c.json({error:"company_context_missing"},400);
     if(u.role!=="company"&&u.role!=="admin")return c.json({error:"company_role_required",stage:"job_auth",role:u.role},403);
     const jid=c.req.param("id");
-    const companyId=await effectiveCompanyId(c.env.DB,u);
-    const existing=await c.env.DB.prepare("SELECT id,title,status FROM jobs WHERE id=? AND company_id=? LIMIT 1").bind(jid,companyId).first<any>();
+    const companyIds=await companyContextIds(c.env.DB,u);
+    if(!companyIds.length)return c.json({error:"company_context_missing"},400);
+    const existing=await c.env.DB.prepare(`SELECT id,title,status FROM jobs WHERE id=? AND company_id IN (${sqlIn(companyIds)}) LIMIT 1`).bind(jid,...companyIds).first<any>();
     if(!existing||existing.status==='deleted')return c.json({error:"job_not_found"},404);
     // Soft delete: keep applications/screening history intact while removing the job from the active workspace.
-    await c.env.DB.prepare("UPDATE jobs SET status='deleted' WHERE id=? AND company_id=?").bind(jid,companyId).run();
+    await c.env.DB.prepare(`UPDATE jobs SET status='deleted' WHERE id=? AND company_id IN (${sqlIn(companyIds)})`).bind(jid,...companyIds).run();
     await audit(c,u,"job.delete",jid);
     return c.json({ok:true,id:jid,deleted:true});
   }catch(e:any){
@@ -1169,7 +1186,7 @@ function renderProfessionalScreeningResult(raw){
 <style>
 .section-head{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:14px}.section-head h2{margin-bottom:4px}.form-actions{display:flex;gap:8px;align-items:center;margin-top:12px}.table-wrap{overflow:auto}.job-actions{display:flex;gap:8px;flex-wrap:wrap}.job-action{white-space:nowrap;min-width:72px}.job-status{display:inline-flex;padding:5px 9px;border-radius:999px;background:#ecfdf3;color:#047857;font-size:12px;font-weight:750;text-transform:capitalize}.job-status.closed{background:#f1f5f9;color:#64748b}.job-empty{text-align:center;color:#64748b;padding:34px}.job-empty strong{color:#17365d;font-size:14px}.job-empty span{display:inline-block;margin-top:4px;font-size:12px}.job-danger{color:#b91c1c!important;border-color:#fecaca!important;background:#fff7f7!important}.job-danger:hover{background:#fee2e2!important}.pool-head{display:flex;justify-content:space-between;align-items:flex-start;gap:20px;margin-bottom:16px}.pool-head h2{margin-bottom:4px}.pool-kicker{font-size:10px;letter-spacing:.1em;font-weight:800;color:#64748b;margin-bottom:5px}.pool-legend{display:flex;gap:12px;flex-wrap:wrap;align-items:center;padding:9px 11px;border:1px solid #e5ebf2;border-radius:10px;background:#f8fafc;color:#64748b;font-size:11px}.pool-legend span{display:inline-flex;align-items:center;gap:5px}.legend-dot{width:7px;height:7px;border-radius:50%;display:inline-block}.legend-dot.ready{background:#10b981}.legend-dot.screened{background:#3b82f6}.legend-dot.pending{background:#f59e0b}.pool-head+.job-title-cell{display:flex;flex-direction:column;gap:4px}.job-title-cell strong{color:#102a43;font-size:14px}.job-title-cell span{font-size:11px;color:#94a3b8;margin-top:3px}.screen-loading{display:flex;align-items:center;gap:12px;padding:18px;border:1px solid #dbe5f0;background:#f8fafc;border-radius:12px;color:#334155}.screen-loading strong{display:block}.screen-loading small{display:block;color:#64748b;margin-top:3px}.loader-dot{width:12px;height:12px;border-radius:50%;border:2px solid #bfdbfe;border-top-color:#1769e0;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}@media(max-width:700px){.section-head{align-items:flex-start;flex-direction:column}.job-actions{flex-direction:row;align-items:stretch}.job-action{width:auto}} .header-account{position:relative}.account-trigger{display:flex;align-items:center;gap:9px;border:1px solid #e2e8f0;background:#fff;border-radius:12px;padding:7px 10px;cursor:pointer;color:#17365d}.account-avatar{width:32px;height:32px;border-radius:10px;background:#eaf2ff;color:#1769e0;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:800}.account-trigger small{display:block;text-align:left;color:#64748b;font-size:11px;font-weight:500;max-width:210px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.account-trigger b{display:block;text-align:left;font-size:12px}.account-chevron{color:#94a3b8}.account-menu{position:absolute;right:0;top:52px;z-index:30;min-width:210px;background:#fff;border:1px solid #dbe4ef;border-radius:12px;box-shadow:0 16px 40px rgba(15,23,42,.12);padding:7px}.account-menu button,.account-menu a{display:block;width:100%;box-sizing:border-box;text-align:left;padding:10px 11px;border:0;background:transparent;color:#334155;border-radius:8px;text-decoration:none;cursor:pointer;font:inherit}.account-menu button:hover,.account-menu a:hover{background:#f4f7fb}.modal{position:fixed;inset:0;z-index:100}.modal-backdrop{position:absolute;inset:0;background:rgba(15,23,42,.35);backdrop-filter:blur(2px)}.modal-card{position:relative;max-width:860px;max-height:88vh;overflow:auto;margin:5vh auto;background:#fff;border-radius:18px;padding:24px;box-shadow:0 24px 80px rgba(15,23,42,.22)}.modal-head{display:flex;justify-content:space-between;gap:18px;align-items:flex-start;border-bottom:1px solid #edf1f5;padding-bottom:16px;margin-bottom:18px}.profile-grid{display:grid;grid-template-columns:1fr 1fr;gap:4px 14px}.profile-grid label,.modal-card>form>label{font-size:12px;font-weight:700;color:#475569}.profile-grid .input,.modal-card .input{margin-top:6px}.credit-balance{display:inline-flex;padding:10px 14px;border-radius:12px;background:#eef7ff;color:#1459c7;font-weight:800}.payment-box{padding:16px;border:1px solid #dbe4ef;border-radius:12px;background:#f8fafc;line-height:1.8;margin-bottom:16px}.billing-payment-box{margin:18px 0}.billing-payment-box small{display:block;margin-top:8px;color:#64748b}.payment-account-number{font-size:15px}.payment-account-number strong{font-size:17px;color:#102a43}.package-payment-note{margin-top:12px;padding:10px 11px;border:1px solid #dbe7f5;border-radius:10px;background:#f8fbff;display:flex;flex-direction:column;gap:2px;font-size:11px;color:#475569}.package-payment-note b{font-size:11px;color:#1459c7}.package-payment-note span{font-size:11px}.package-payment-note strong{font-size:13px;color:#102a43;letter-spacing:.02em}.package-payment-note small{font-size:10px;color:#64748b;margin-top:2px}.proof-upload{padding:10px 12px;border:1px dashed #9bbcf0;border-radius:10px;background:#f8fbff}.proof-upload .input{margin:0 0 5px}.required-mark{color:#b42318}.pill.awaiting_payment{background:#fff7ed;color:#c2410c}.pill.payment_submitted{background:#eef4ff;color:#1459c7}.pill.cancelled{background:#f1f5f9;color:#64748b}.credit-packages{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.credit-package{border:1px solid #dbe4ef;border-radius:14px;padding:17px;background:linear-gradient(180deg,#fff,#f9fbfe)}.credit-package.featured{border-color:#9bc1ff;box-shadow:0 8px 24px rgba(23,105,224,.1)}.credit-package h3{margin:0;color:#17365d}.credit-price{font-size:23px;font-weight:800;color:#102a4c;margin:10px 0}.credit-tag{font-size:11px;color:#64748b;min-height:30px}.credit-buy{width:100%;margin-top:12px}.usage-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.usage-card{padding:15px;border:1px solid #e2e8f0;border-radius:12px;background:#f8fafc}.usage-card b{display:block;font-size:20px;color:#17365d}.usage-card span{font-size:12px;color:#64748b}@media(max-width:800px){.credit-packages{grid-template-columns:1fr 1fr}.profile-grid{grid-template-columns:1fr}.usage-grid{grid-template-columns:1fr}}@media(max-width:600px){.credit-packages{grid-template-columns:1fr}.account-trigger span:nth-child(2){display:none}.modal-card{margin:2vh 10px;max-height:94vh}}
 </style>
-<script src="/app.js?v=636" defer></script></body></html>`));
+<script src="/app.js?v=659" defer></script></body></html>`));
 
 app.notFound((c) => c.json({ error: "not_found" }, 404));
 
