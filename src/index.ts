@@ -74,11 +74,16 @@ async function createAdminSession(c:any,email:string){
   const payload=b64url(enc.encode(JSON.stringify({sub:"super-admin",email,exp:Math.floor(Date.now()/1000)+7*86400,iat:Math.floor(Date.now()/1000)})));
   const key=await adminSigningKey(c);
   const sig=b64url(new Uint8Array(await crypto.subtle.sign("HMAC",key,enc.encode(payload))));
-  c.header("Set-Cookie",adminCookie(`${payload}.${sig}`,7*86400));
+  const token=`${payload}.${sig}`;
+  c.header("Set-Cookie",adminCookie(token,7*86400));
+  return token;
 }
 async function currentAdminCookie(c:any):Promise<AuthUser|null>{
   const h=c.req.raw.headers.get("Cookie")||"";
-  const token=h.match(/(?:^|;\s*)ats_admin=([^;]+)/)?.[1];
+  const cookieToken=h.match(/(?:^|;\s*)ats_admin=([^;]+)/)?.[1];
+  const auth=c.req.raw.headers.get("Authorization")||"";
+  const bearer=auth.match(/^Bearer\s+(.+)$/i)?.[1];
+  const token=cookieToken||bearer||null;
   if(!token)return null;
   try{
     const [payload,sig]=token.split(".");
@@ -915,16 +920,17 @@ app.post("/api/admin/login",async c=>{
     const u:AuthUser={id:"super-admin",company_id:"platform",name:"Super Admin",email:configuredEmail,role:"admin",company_name:"AI Screening Platform"};
 
     stage.step="create_admin_cookie";
+    let token="";
     try{
-      await createAdminSession(c,configuredEmail);
+      token=await createAdminSession(c,configuredEmail);
     }catch(e:any){
       return c.json({error:"admin_session_failed",detail:String(e?.message||e),stage:stage.step,build:"V6.49"},503);
     }
 
     // Audit is deliberately best-effort and can never block authentication.
     stage.step="audit";
-    await audit(c,u,"admin.login",u.id);
-    return c.json({user:u,auth_source:"bootstrap_secret",build:"V6.49"});
+    try{await audit(c,u,"admin.login",u.id)}catch{}
+    return c.json({user:u,admin_token:token,auth_source:"bootstrap_secret",build:"V6.50"});
   }catch(e:any){
     return c.json({error:"admin_login_failed",detail:String(e?.message||e),stage:stage.step,build:"V6.49"},500);
   }
