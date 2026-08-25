@@ -6,3 +6,9 @@ SUPER_ADMIN_EMAIL=admin@yourdomain.com
 SUPER_ADMIN_PASSWORD=change-this-to-a-long-secret
 # Optional: use a PBKDF2 hash instead of storing a plaintext password secret.
 # SUPER_ADMIN_PASSWORD_HASH=pbkdf2$100000$...
+
+# Manual payment instructions shown to company users
+PAYMENT_BANK_NAME=BCA
+PAYMENT_ACCOUNT_NAME=PT Surya Utama International
+PAYMENT_ACCOUNT_NUMBER=YOUR_ACCOUNT_NUMBER
+PAYMENT_QRIS_URL=
