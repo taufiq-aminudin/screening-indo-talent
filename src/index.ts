@@ -60,6 +60,16 @@ async function passwordVerify(password:string,stored:string){
       let binary="";for(const b of digest)binary+=String.fromCharCode(b);
       if(btoa(binary)===rawStored)return true;
     }catch{}
+    const legacyMatch=rawStored.match(/^(?:sha256|sha-256)[$:](.+)$/i);
+    if(legacyMatch){
+      const expected=legacyMatch[1].trim();
+      if(/^[a-f0-9]{64}$/i.test(expected))return (await sha256(password)).toLowerCase()===expected.toLowerCase();
+      try{
+        const digest=new Uint8Array(await crypto.subtle.digest("SHA-256",enc.encode(password)));
+        let binary="";for(const b of digest)binary+=String.fromCharCode(b);
+        if(btoa(binary)===expected)return true;
+      }catch{}
+    }
     const parts=rawStored.split("$");
     if(parts.length!==4)return false;
     const scheme=parts[0].toLowerCase();
@@ -105,6 +115,9 @@ function clearLegacyCookie(){
 function adminCookie(token:string,maxAge:number){
   return `ats_admin=${token}; Max-Age=${maxAge}; Path=/; HttpOnly; Secure; SameSite=Lax`;
 }
+function adminCookieAlias(token:string,maxAge:number){
+  return `super_admin_session=${token}; Max-Age=${maxAge}; Path=/; HttpOnly; Secure; SameSite=Lax`;
+}
 function clearAdminCookie(){
   return adminCookie("",0);
 }
@@ -117,11 +130,13 @@ async function createAdminSession(c:any,email:string){
   const payload=b64url(enc.encode(JSON.stringify({sub:"super-admin",email,exp:Math.floor(Date.now()/1000)+7*86400,iat:Math.floor(Date.now()/1000)})));
   const key=await adminSigningKey(c);
   const sig=b64url(new Uint8Array(await crypto.subtle.sign("HMAC",key,enc.encode(payload))));
-  c.header("Set-Cookie",adminCookie(`${payload}.${sig}`,7*86400));
+  const token=`${payload}.${sig}`;
+  c.header("Set-Cookie",adminCookie(token,7*86400));
+  c.header("Set-Cookie",adminCookieAlias(token,7*86400),{append:true});
 }
 async function currentAdminCookie(c:any):Promise<AuthUser|null>{
   const h=c.req.raw.headers.get("Cookie")||"";
-  const raw=h.match(/(?:^|;\s*)ats_admin=([^;]+)/)?.[1];
+  const raw=h.match(/(?:^|;\s*)ats_admin=([^;]+)/)?.[1] || h.match(/(?:^|;\s*)super_admin_session=([^;]+)/)?.[1];
   if(!raw)return null;
   let token=raw;
   try{token=decodeURIComponent(raw)}catch{}
@@ -292,6 +307,7 @@ app.post("/api/auth/logout",async c=>{
   }catch{}
   c.header("Set-Cookie",setCookie("",0));
   c.header("Set-Cookie",clearAdminCookie(),{append:true});
+  c.header("Set-Cookie",adminCookieAlias("",0),{append:true});
   return c.json({ok:true});
 });
 app.get("/api/auth/me",async c=>{
