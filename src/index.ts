@@ -46,7 +46,7 @@ function b64url(bytes:Uint8Array){let binary="";for(const b of bytes)binary+=Str
 function hex(bytes:Uint8Array){return [...bytes].map(b=>b.toString(16).padStart(2,"0")).join("")}
 async function sha256(v:string){return hex(new Uint8Array(await crypto.subtle.digest("SHA-256",enc.encode(v))))}
 async function passwordHash(password:string){const salt=new Uint8Array(16);crypto.getRandomValues(salt);const key=await crypto.subtle.importKey("raw",enc.encode(password),"PBKDF2",false,["deriveBits"]);const bits=await crypto.subtle.deriveBits({name:"PBKDF2",salt,iterations:100000,hash:"SHA-256"},key,256);return `pbkdf2$100000$${b64url(salt)}$${b64url(new Uint8Array(bits))}`}
-async function passwordVerify(password:string,stored:string){try{const [scheme,it,saltText,expected]=stored.split("$");if(scheme!=="pbkdf2")return false;const sb=saltText.replace(/-/g,"+").replace(/_/g,"/");const bin=atob(sb+"=".repeat((4-sb.length%4)%4));const salt=Uint8Array.from(bin,c=>c.charCodeAt(0));const key=await crypto.subtle.importKey("raw",enc.encode(password),"PBKDF2",false,["deriveBits"]);const declared=Number(it);if(!Number.isFinite(declared)||declared<1||declared>600000)return false;const bits=await crypto.subtle.deriveBits({name:"PBKDF2",salt,iterations:declared,hash:"SHA-256"},key,256);return b64url(new Uint8Array(bits))===expected}catch{return false}}
+async function passwordVerify(password:string,stored:string){try{const [scheme,it,saltText,expected]=stored.split("$");if(scheme!=="pbkdf2")return false;const sb=saltText.replace(/-/g,"+").replace(/_/g,"/");const bin=atob(sb+"=".repeat((4-sb.length%4)%4));const salt=Uint8Array.from(bin,c=>c.charCodeAt(0));const key=await crypto.subtle.importKey("raw",enc.encode(password),"PBKDF2",false,["deriveBits"]);const iterations=Math.min(Number(it)||100000,100000);const bits=await crypto.subtle.deriveBits({name:"PBKDF2",salt,iterations,hash:"SHA-256"},key,256);return b64url(new Uint8Array(bits))===expected}catch{return false}}
 function cookieToken(req:Request){
   const h=req.headers.get("Cookie")||"";
   return h.match(/(?:^|;\s*)ats_session=([^;]+)/)?.[1]
@@ -74,12 +74,82 @@ async function createAdminSession(c:any,email:string){
   const payload=b64url(enc.encode(JSON.stringify({sub:"super-admin",email,exp:Math.floor(Date.now()/1000)+7*86400,iat:Math.floor(Date.now()/1000)})));
   const key=await adminSigningKey(c);
   const sig=b64url(new Uint8Array(await crypto.subtle.sign("HMAC",key,enc.encode(payload))));
-  c.header("Set-Cookie",adminCookie(`${payload}.${sig}`,7*86400));
+  const token=`${payload}.${sig}`;
+  c.header("Set-Cookie",adminCookie(token,7*86400));
+  return token;
 }
 async function currentAdminCookie(c:any):Promise<AuthUser|null>{
   const h=c.req.raw.headers.get("Cookie")||"";
   const token=h.match(/(?:^|;\s*)ats_admin=([^;]+)/)?.[1];
   if(!token)return null;
+  return verifyAdminToken(c,token);
+}
+async function columns(db:D1Database,table:string){const r=await db.prepare(`PRAGMA table_info(${table})`).all<any>();return new Set((r.results||[]).map((x:any)=>String(x.name)))}
+async function createSession(c:any,u:AuthUser){
+  const token=b64url(crypto.getRandomValues(new Uint8Array(32)));
+  const expires=new Date(Date.now()+7*86400000).toISOString();
+  await c.env.DB.prepare("INSERT INTO sessions(token,user_id,expires_at) VALUES(?,?,?)")
+    .bind(await sha256(token),u.id,expires).run();
+  c.header("Set-Cookie",setCookie(token,7*86400));
+  return token;
+}
+function bearerToken(req:Request){
+  const h=req.headers.get("Authorization")||"";
+  const m=h.match(/^Bearer\s+(.+)$/i);
+  return m?.[1]?.trim()||null;
+}
+async function currentUser(c:any):Promise<AuthUser|null>{
+  const req=c.req.raw;
+  const bearer=bearerToken(req);
+  if(bearer){
+    const admin=await verifyAdminToken(c,bearer);
+    if(admin)return admin;
+    try{
+      const tokenHash=await sha256(bearer);
+      const session=await c.env.DB.prepare(
+        "SELECT user_id FROM sessions WHERE token=? AND expires_at>CURRENT_TIMESTAMP LIMIT 1"
+      ).bind(tokenHash).first<any>();
+      if(session){
+        if(session.user_id==="super-admin"){
+          const cfg=adminConfig(c);
+          if(cfg.email)return {id:"super-admin",company_id:"platform",name:"Super Admin",email:cfg.email,role:"admin",company_name:"AI Screening Platform"};
+        }else{
+          const row=await c.env.DB.prepare(
+            "SELECT u.id,u.company_id,u.name,u.email,u.role,COALESCE(cp.company_name,u.name) company_name " +
+            "FROM users u LEFT JOIN company_profiles cp ON cp.user_id=u.company_id WHERE u.id=? LIMIT 1"
+          ).bind(session.user_id).first<AuthUser>();
+          if(row)return row;
+        }
+      }
+    }catch(e:any){
+      throw new Error("session_lookup_failed: "+String(e?.message||e));
+    }
+  }
+  const admin=await currentAdminCookie(c);
+  if(admin)return admin;
+  const raw=cookieToken(req);
+  if(!raw)return null;
+  try{
+    const tokenHash=await sha256(raw);
+    const session=await c.env.DB.prepare(
+      "SELECT user_id FROM sessions WHERE token=? AND expires_at>CURRENT_TIMESTAMP LIMIT 1"
+    ).bind(tokenHash).first<any>();
+    if(!session)return null;
+    if(session.user_id==="super-admin"){
+      const cfg=adminConfig(c);
+      if(!cfg.email)return null;
+      return {id:"super-admin",company_id:"platform",name:"Super Admin",email:cfg.email,role:"admin",company_name:"AI Screening Platform"};
+    }
+    const row=await c.env.DB.prepare(
+      "SELECT u.id,u.company_id,u.name,u.email,u.role,COALESCE(cp.company_name,u.name) company_name " +
+      "FROM users u LEFT JOIN company_profiles cp ON cp.user_id=u.company_id WHERE u.id=? LIMIT 1"
+    ).bind(session.user_id).first<AuthUser>();
+    return row||null;
+  }catch(e:any){
+    throw new Error("session_lookup_failed: "+String(e?.message||e));
+  }
+}
+async function verifyAdminToken(c:any,token:string):Promise<AuthUser|null>{
   try{
     const [payload,sig]=token.split(".");
     if(!payload||!sig)return null;
@@ -95,47 +165,6 @@ async function currentAdminCookie(c:any):Promise<AuthUser|null>{
     if(data.sub!=="super-admin"||!data.email||data.email!==cfg.email||Number(data.exp||0)<Math.floor(Date.now()/1000))return null;
     return {id:"super-admin",company_id:"platform",name:"Super Admin",email:cfg.email,role:"admin",company_name:"AI Screening Platform"};
   }catch{return null}
-}
-async function columns(db:D1Database,table:string){const r=await db.prepare(`PRAGMA table_info(${table})`).all<any>();return new Set((r.results||[]).map((x:any)=>String(x.name)))}
-async function createSession(c:any,u:AuthUser){
-  const token=b64url(crypto.getRandomValues(new Uint8Array(32)));
-  const expires=new Date(Date.now()+7*86400000).toISOString();
-  await c.env.DB.prepare("INSERT INTO sessions(token,user_id,expires_at) VALUES(?,?,?)")
-    .bind(await sha256(token),u.id,expires).run();
-  c.header("Set-Cookie",setCookie(token,7*86400));
-}
-async function currentUser(c:any):Promise<AuthUser|null>{
-  const admin=await currentAdminCookie(c);
-  if(admin)return admin;
-  const raw=cookieToken(c.req.raw);
-  if(!raw)return null;
-  try{
-    const tokenHash=await sha256(raw);
-    const session=await c.env.DB.prepare(
-      "SELECT user_id FROM sessions WHERE token=? AND expires_at>CURRENT_TIMESTAMP LIMIT 1"
-    ).bind(tokenHash).first<any>();
-    if(!session)return null;
-    if(session.user_id==="super-admin"){
-      const cfg=adminConfig(c);
-      if(!cfg.email)return null;
-      return {
-        id:"super-admin",
-        company_id:"platform",
-        name:"Super Admin",
-        email:cfg.email,
-        role:"admin",
-        company_name:"AI Screening Platform"
-      };
-    }
-    const row=await c.env.DB.prepare(
-      "SELECT u.id,u.company_id,u.name,u.email,u.role,COALESCE(cp.company_name,u.name) company_name " +
-      "FROM users u LEFT JOIN company_profiles cp ON cp.user_id=u.company_id " +
-      "WHERE u.id=? LIMIT 1"
-    ).bind(session.user_id).first<AuthUser>();
-    return row||null;
-  }catch(e:any){
-    throw new Error("session_lookup_failed: "+String(e?.message||e));
-  }
 }
 async function companyScopeIds(db:D1Database,u:AuthUser):Promise<string[]>{
   const ids:string[]=[];
@@ -244,10 +273,10 @@ app.post("/api/auth/login",async c=>{
     if(!r)return c.json({error:"invalid_credentials"},401);
     if(!(await passwordVerify(password,r.password_hash)))return c.json({error:"invalid_credentials"},401);
     const u:AuthUser={id:r.id,company_id:r.company_id||r.id,name:r.name,email:r.email,role:r.role,company_name:r.company_name};
-    await createSession(c,u);
+    const session_token=await createSession(c,u);
     await audit(c,u,"auth.login",u.id);
     c.header("Cache-Control","no-store");
-    return c.json({user:u});
+    return c.json({user:u,session_token});
   }catch(e:any){
     return c.json({error:"login_failed",detail:String(e?.message||e)},500);
   }
@@ -255,7 +284,9 @@ app.post("/api/auth/login",async c=>{
 app.post("/api/auth/logout",async c=>{
   try{
     const raw=cookieToken(c.req.raw);
-    if(raw)await c.env.DB.prepare("DELETE FROM sessions WHERE token=?").bind(await sha256(raw)).run();
+    const bearer=bearerToken(c.req.raw);
+    const tokens=[raw,bearer].filter(Boolean) as string[];
+    for(const token of tokens)await c.env.DB.prepare("DELETE FROM sessions WHERE token=?").bind(await sha256(token)).run();
   }catch{}
   c.header("Set-Cookie",setCookie("",0));
   c.header("Set-Cookie",clearAdminCookie(),{append:true});
@@ -914,8 +945,9 @@ app.post("/api/admin/login",async c=>{
     const u:AuthUser={id:"super-admin",company_id:"platform",name:"Super Admin",email:configuredEmail,role:"admin",company_name:"AI Screening Platform"};
 
     stage.step="create_admin_cookie";
+    let admin_token="";
     try{
-      await createAdminSession(c,configuredEmail);
+      admin_token=await createAdminSession(c,configuredEmail);
     }catch(e:any){
       return c.json({error:"admin_session_failed",detail:String(e?.message||e),stage:stage.step,build:"V6.49"},503);
     }
@@ -923,7 +955,7 @@ app.post("/api/admin/login",async c=>{
     // Audit is deliberately best-effort and can never block authentication.
     stage.step="audit";
     await audit(c,u,"admin.login",u.id);
-    return c.json({user:u,auth_source:"bootstrap_secret",build:"V6.49"});
+    return c.json({user:u,admin_token,auth_source:"bootstrap_secret",build:"V6.49"});
   }catch(e:any){
     return c.json({error:"admin_login_failed",detail:String(e?.message||e),stage:stage.step,build:"V6.49"},500);
   }
@@ -975,11 +1007,11 @@ async function superAdminHtml(c:any){
   if(admin){
     return c.html(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Super Admin · ${c.env.APP_NAME}</title><style>
 body{margin:0;background:#f5f7fb;font-family:Inter,system-ui,sans-serif;color:#10213b}.wrap{max-width:1220px;margin:30px auto;padding:0 18px}.card{background:#fff;border:1px solid #e3e8f0;border-radius:18px;padding:22px;box-shadow:0 8px 28px rgba(16,33,59,.06);margin-bottom:16px}.loading{text-align:center;padding:55px}.brand{font-size:22px;font-weight:800;margin-bottom:6px}.input{width:100%;box-sizing:border-box;padding:12px;border:1px solid #d7deea;border-radius:10px;margin:6px 0 14px}.btn{border:0;border-radius:10px;padding:10px 14px;background:#0b66ff;color:#fff;cursor:pointer;font-weight:700}.btn.secondary{background:#edf2f8;color:#20304a}.btn.danger{background:#fff0f0;color:#b42318;border:1px solid #fecaca}.muted{color:#667085}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.metric b{display:block;font-size:28px;margin-top:8px}.table-wrap{overflow:auto}.table{width:100%;border-collapse:collapse;min-width:920px}.table th,.table td{text-align:left;padding:11px 10px;border-bottom:1px solid #edf0f5;vertical-align:middle}.pill{display:inline-flex;padding:5px 9px;border-radius:999px;background:#eef4ff;color:#1459c7;font-size:12px;font-weight:700}.pill.pending{background:#fff7ed;color:#c2410c}.pill.paid{background:#ecfdf3;color:#047857}.pill.rejected{background:#fef2f2;color:#b91c1c}.packages{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.package{border:1px solid #dbe4ef;border-radius:14px;padding:18px}.package h3{margin:0}.price{font-size:24px;font-weight:800;margin:12px 0}.tag{font-size:12px;color:#64748b}.section-head{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:12px}.filters{display:flex;gap:8px;flex-wrap:wrap}.empty{text-align:center;color:#667085;padding:25px}.actions{display:flex;gap:7px;flex-wrap:wrap}.small{font-size:12px;color:#667085}.admin-warning{border-left:4px solid #d97706;background:#fffbeb}.admin-error{margin:14px 0;padding:12px;border-radius:10px;background:#fff1f2;border:1px solid #fecdd3;color:#9f1239;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;white-space:pre-wrap;overflow:auto}@media(max-width:900px){.grid,.packages{grid-template-columns:1fr 1fr}}@media(max-width:600px){.grid,.packages{grid-template-columns:1fr}.section-head{align-items:flex-start;flex-direction:column}}
-</style></head><body><div id="root" class="wrap"><div class="card loading"><h2>Super Admin</h2><p>Authenticated. Loading dashboard…</p><noscript><p>JavaScript diperlukan untuk dashboard Super Admin.</p></noscript></div></div><script src="/super-admin-v52.js?v=61-authfix" defer></script></body></html>`);
+</style></head><body><div id="root" class="wrap"><div class="card loading"><h2>Super Admin</h2><p>Authenticated. Loading dashboard…</p><noscript><p>JavaScript diperlukan untuk dashboard Super Admin.</p></noscript></div></div><script src="/super-admin-v52.js?v=52" defer></script></body></html>`);
   }
   return c.html(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Super Admin · ${c.env.APP_NAME}</title><style>
 body{margin:0;background:#f5f7fb;font-family:Inter,system-ui,sans-serif;color:#10213b}.wrap{max-width:1220px;margin:30px auto;padding:0 18px}.card{background:#fff;border:1px solid #e3e8f0;border-radius:18px;padding:22px;box-shadow:0 8px 28px rgba(16,33,59,.06);margin-bottom:16px}.login{max-width:420px;margin:100px auto}.brand{font-size:22px;font-weight:800;margin-bottom:6px}.input{width:100%;box-sizing:border-box;padding:12px;border:1px solid #d7deea;border-radius:10px;margin:6px 0 14px}.btn{border:0;border-radius:10px;padding:10px 14px;background:#0b66ff;color:#fff;cursor:pointer;font-weight:700}.btn.secondary{background:#edf2f8;color:#20304a}.btn.danger{background:#fff0f0;color:#b42318;border:1px solid #fecaca}.muted{color:#667085}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.metric b{display:block;font-size:28px;margin-top:8px}.table-wrap{overflow:auto}.table{width:100%;border-collapse:collapse;min-width:920px}.table th,.table td{text-align:left;padding:11px 10px;border-bottom:1px solid #edf0f5;vertical-align:middle}.pill{display:inline-flex;padding:5px 9px;border-radius:999px;background:#eef4ff;color:#1459c7;font-size:12px;font-weight:700}.pill.pending{background:#fff7ed;color:#c2410c}.pill.paid{background:#ecfdf3;color:#047857}.pill.rejected{background:#fef2f2;color:#b91c1c}.packages{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.package{border:1px solid #dbe4ef;border-radius:14px;padding:18px}.package h3{margin:0}.price{font-size:24px;font-weight:800;margin:12px 0}.tag{font-size:12px;color:#64748b}.section-head{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:12px}.filters{display:flex;gap:8px;flex-wrap:wrap}.empty{text-align:center;color:#667085;padding:25px}.actions{display:flex;gap:7px;flex-wrap:wrap}.small{font-size:12px;color:#667085}.admin-warning{border-left:4px solid #d97706;background:#fffbeb}.admin-error{margin:14px 0;padding:12px;border-radius:10px;background:#fff1f2;border:1px solid #fecdd3;color:#9f1239;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;white-space:pre-wrap;overflow:auto}@media(max-width:900px){.grid,.packages{grid-template-columns:1fr 1fr}}@media(max-width:600px){.grid,.packages{grid-template-columns:1fr}.section-head{align-items:flex-start;flex-direction:column}}
-</style></head><body><div id="root" class="wrap"><div class="card login"><div class="brand">AI Screening · Super Admin</div><p class="muted">Platform administration and commercial control.</p><div id="cfg" class="muted" style="font-size:12px;margin:14px 0">Checking secure configuration…</div><form id="f" action="/super-admin/login" method="POST"><label>Email</label><input id="e" name="email" class="input" type="email" required autocomplete="username"><label>Password</label><input id="p" name="password" class="input" type="password" required autocomplete="current-password"><button class="btn" type="submit">Sign in</button><p id="m" class="muted">${message}</p></form></div></div><script src="/super-admin-v52.js?v=61-authfix" defer></script></body></html>`);
+</style></head><body><div id="root" class="wrap"><div class="card login"><div class="brand">AI Screening · Super Admin</div><p class="muted">Platform administration and commercial control.</p><div id="cfg" class="muted" style="font-size:12px;margin:14px 0">Checking secure configuration…</div><form id="f" action="/super-admin/login" method="POST"><label>Email</label><input id="e" name="email" class="input" type="email" required autocomplete="username"><label>Password</label><input id="p" name="password" class="input" type="password" required autocomplete="current-password"><button class="btn" type="submit">Sign in</button><p id="m" class="muted">${message}</p></form></div></div><script src="/super-admin-v52.js?v=52" defer></script></body></html>`);
 }
 app.get(SUPER_ADMIN_PATH, superAdminHtml);
 app.get(SUPER_ADMIN_LEGACY_PATH, superAdminHtml);
