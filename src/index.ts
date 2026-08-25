@@ -48,7 +48,19 @@ async function sha256(v:string){return hex(new Uint8Array(await crypto.subtle.di
 async function passwordHash(password:string){const salt=new Uint8Array(16);crypto.getRandomValues(salt);const key=await crypto.subtle.importKey("raw",enc.encode(password),"PBKDF2",false,["deriveBits"]);const bits=await crypto.subtle.deriveBits({name:"PBKDF2",salt,iterations:100000,hash:"SHA-256"},key,256);return `pbkdf2$100000$${b64url(salt)}$${b64url(new Uint8Array(bits))}`}
 async function passwordVerify(password:string,stored:string){
   try{
-    const parts=String(stored||"").trim().split("$");
+    const rawStored=String(stored||"").trim();
+    // Keep compatibility with company accounts created by older builds.
+    // Current accounts use PBKDF2; legacy builds may have stored a plain
+    // SHA-256 digest (hex or base64). Do not alter the stored credential.
+    if(/^[a-f0-9]{64}$/i.test(rawStored)){
+      return (await sha256(password)).toLowerCase()===rawStored.toLowerCase();
+    }
+    try{
+      const digest=new Uint8Array(await crypto.subtle.digest("SHA-256",enc.encode(password)));
+      let binary="";for(const b of digest)binary+=String.fromCharCode(b);
+      if(btoa(binary)===rawStored)return true;
+    }catch{}
+    const parts=rawStored.split("$");
     if(parts.length!==4)return false;
     const scheme=parts[0].toLowerCase();
     if(scheme!=="pbkdf2"&&scheme!=="pbkdf2-sha256"&&scheme!=="pbkdf2_sha256")return false;
@@ -78,9 +90,11 @@ async function passwordVerify(password:string,stored:string){
 }
 function cookieToken(req:Request){
   const h=req.headers.get("Cookie")||"";
-  return h.match(/(?:^|;\s*)ats_session=([^;]+)/)?.[1]
+  const raw=h.match(/(?:^|;\s*)ats_session=([^;]+)/)?.[1]
     || h.match(/(?:^|;\s*)session=([^;]+)/)?.[1]
     || null;
+  if(!raw)return null;
+  try{return decodeURIComponent(raw)}catch{return raw}
 }
 function setCookie(token:string,maxAge:number){
   return `ats_session=${token}; Max-Age=${maxAge}; Path=/; HttpOnly; Secure; SameSite=Lax`;
@@ -107,8 +121,10 @@ async function createAdminSession(c:any,email:string){
 }
 async function currentAdminCookie(c:any):Promise<AuthUser|null>{
   const h=c.req.raw.headers.get("Cookie")||"";
-  const token=h.match(/(?:^|;\s*)ats_admin=([^;]+)/)?.[1];
-  if(!token)return null;
+  const raw=h.match(/(?:^|;\s*)ats_admin=([^;]+)/)?.[1];
+  if(!raw)return null;
+  let token=raw;
+  try{token=decodeURIComponent(raw)}catch{}
   try{
     const [payload,sig]=token.split(".");
     if(!payload||!sig)return null;
@@ -278,7 +294,17 @@ app.post("/api/auth/logout",async c=>{
   c.header("Set-Cookie",clearAdminCookie(),{append:true});
   return c.json({ok:true});
 });
-app.get("/api/auth/me",requireAuth,c=>c.json({user:c.get("user")}));
+app.get("/api/auth/me",async c=>{
+  c.header("Cache-Control","no-store, no-cache, must-revalidate");
+  try{
+    const u=await currentUser(c);
+    if(!u)return c.json({error:"unauthorized"},401);
+    c.set("user",u);
+    return c.json({user:u});
+  }catch(e:any){
+    return c.json({error:"auth_failed",detail:String(e?.message||e)},500);
+  }
+});
 app.get("/api/auth/status",async c=>{
   try{
     const u=await currentUser(c);
