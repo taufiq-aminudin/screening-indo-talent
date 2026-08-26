@@ -16,7 +16,6 @@ export default async function handleAuthMe(request) {
   const [email, signature] = atsAdmin.split(":");
   const SESSION_SECRET = process.env.SESSION_SECRET;
 
-  // Verifikasi HMAC
   const encoder = new TextEncoder();
   const key = await crypto.subtle.importKey(
     "raw",
