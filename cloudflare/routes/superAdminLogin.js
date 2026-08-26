@@ -1,21 +1,34 @@
-// cloudflare/routes/superAdminLogin.js
-export default async function handleAdminLogin(request) {
+export default async function handleAdminLogin(request, env) {
   const { email, password } = await request.json();
 
-  const SUPER_ADMIN_EMAIL = process.env.SUPER_ADMIN_EMAIL;
-  const SUPER_ADMIN_PASSWORD = process.env.SUPER_ADMIN_PASSWORD;
-  const SESSION_SECRET = process.env.SESSION_SECRET;
+  const SUPER_ADMIN_EMAIL = env.SUPER_ADMIN_EMAIL;
+  const SUPER_ADMIN_PASSWORD = env.SUPER_ADMIN_PASSWORD;
+  const SESSION_SECRET = env.SESSION_SECRET;
 
-  if (email !== SUPER_ADMIN_EMAIL || password !== SUPER_ADMIN_PASSWORD) {
-    return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 });
+  if (
+    email !== SUPER_ADMIN_EMAIL ||
+    password !== SUPER_ADMIN_PASSWORD
+  ) {
+    return new Response(
+      JSON.stringify({ error: "unauthorized" }),
+      {
+        status: 401,
+        headers: {
+          "Content-Type": "application/json"
+        }
+      }
+    );
   }
 
-  // Buat cookie ats_admin dengan HMAC
   const encoder = new TextEncoder();
+
   const key = await crypto.subtle.importKey(
     "raw",
     encoder.encode(SESSION_SECRET),
-    { name: "HMAC", hash: "SHA-256" },
+    {
+      name: "HMAC",
+      hash: "SHA-256"
+    },
     false,
     ["sign"]
   );
@@ -23,15 +36,29 @@ export default async function handleAdminLogin(request) {
   const signature = await crypto.subtle.sign(
     "HMAC",
     key,
-    encoder.encode(email + Date.now())
+    encoder.encode(email)
   );
 
-  const cookieValue = `${email}:${Buffer.from(signature).toString("hex")}`;
-  const headers = new Headers();
-  headers.append("Set-Cookie", `ats_admin=${cookieValue}; HttpOnly; Secure; SameSite=Strict; Path=/`);
+  const signatureHex = Array.from(
+    new Uint8Array(signature)
+  )
+    .map(b => b.toString(16).padStart(2, "0"))
+    .join("");
 
-  return new Response(JSON.stringify({ success: true, stage: "V6.44" }), {
-    status: 200,
-    headers
-  });
+  const cookieValue = `${email}:${signatureHex}`;
+
+  return new Response(
+    JSON.stringify({
+      success: true,
+      stage: "V6.44"
+    }),
+    {
+      status: 200,
+      headers: {
+        "Content-Type": "application/json",
+        "Set-Cookie":
+          `ats_admin=${cookieValue}; HttpOnly; Secure; SameSite=Strict; Path=/`
+      }
+    }
+  );
 }
