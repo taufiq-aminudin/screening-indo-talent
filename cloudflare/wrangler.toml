@@ -2,6 +2,12 @@ name = "indo-talent-erp"
 main = "cloudflare/index.js"
 compatibility_date = "2026-08-26"
 
+# Keep production secrets in Cloudflare Worker Secrets / environment.
+# Required:
+# SUPER_ADMIN_EMAIL
+# SUPER_ADMIN_PASSWORD_HASH  (format: pbkdf2$100000$<salt>$<hash>)
+# SESSION_SECRET
+
 [triggers]
 routes = ["https://screening.indo-talent.my.id/api/*"]
 
