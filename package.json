@@ -1,7 +1,7 @@
 {
   "name": "ai-screening-saas",
   "private": true,
-  "version": "0.7.1",
+  "version": "0.7.0",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
@@ -9,9 +9,7 @@
     "db:migrate:remote": "wrangler d1 migrations apply indo-talent-db --remote"
   },
   "dependencies": {
-    "hono": "^4.6.12",
-    "unpdf": "^1.8.0",
-    "fflate": "^0.8.3"
+    "hono": "^4.6.12"
   },
   "devDependencies": {
     "wrangler": "^4.30.0",

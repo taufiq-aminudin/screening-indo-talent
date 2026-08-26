@@ -1,14 +1,2 @@
 OPENAI_API_KEY=
 OPENAI_MODEL=gpt-4o-mini
-
-# Optional platform admin bootstrap
-SUPER_ADMIN_EMAIL=admin@yourdomain.com
-SUPER_ADMIN_PASSWORD=change-this-to-a-long-secret
-# Optional: use a PBKDF2 hash instead of storing a plaintext password secret.
-# SUPER_ADMIN_PASSWORD_HASH=pbkdf2$100000$...
-
-# Manual payment instructions shown to company users
-PAYMENT_BANK_NAME=Bank Mandiri
-PAYMENT_ACCOUNT_NAME=PT Surya Utama International
-PAYMENT_ACCOUNT_NUMBER=185-00-1084321-4
-PAYMENT_QRIS_URL=

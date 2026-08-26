@@ -50,12 +50,3 @@ AI output is decision support, not an automatic hiring decision.
 ## V6.1 update
 
 The foundation now includes authentication, tenant-isolated protected routes, D1-backed sessions, R2 CV upload, a recruiter dashboard, rule-based screening, and an OpenAI Responses API screening endpoint. Apply `migrations/0002_auth_uploads.sql` to `indo-talent-db` before using the new authenticated routes.
-
-V6.41: Super Admin login hardening included.
-
-
-## V6.43 — Hidden Super Admin Login
-- Super Admin login is no longer exposed in the normal company profile/account menu.
-- Hidden login route: `/platform-control-7f9a2d`
-- The route sends `X-Robots-Tag: noindex, nofollow, noarchive`.
-- Access still requires the configured Super Admin credentials; the hidden URL is not a security boundary.
